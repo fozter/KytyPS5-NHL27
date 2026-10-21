@@ -3226,6 +3226,19 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Diagnostic (uncommitted): name the host thread after the guest thread, for
+	// KYTY_DIAG_SAMPLER=3 and debuggers.
+	if (!thread->name.empty()) {
+		using Describe = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+		static const auto describe = reinterpret_cast<Describe>(reinterpret_cast<void*>(
+		    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
+		if (describe != nullptr) {
+			const std::wstring wide(thread->name.begin(), thread->name.end());
+			describe(GetCurrentThread(), wide.c_str());
+		}
+	}
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)

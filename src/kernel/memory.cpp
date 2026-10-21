@@ -15,6 +15,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -858,7 +859,98 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+// Diagnostic (uncommitted): shader-resource reads that needed a GPU readback: writer shader,
+// read size, and whether the bytes changed since the last read of the same range.
+static void SrtReadDiag(uint64_t vaddr, uint64_t size, const void* data) {
+	static std::map<uint64_t, uint64_t>                     writers;
+	static std::map<std::pair<uint64_t, uint64_t>, uint64_t> pairs;
+	static std::map<std::pair<uint64_t, uint64_t>, uint64_t> last_hash;
+	static uint64_t sizes[4] = {}, unchanged = 0, changed = 0, first = 0, total = 0;
+	uint64_t        writer   = 0;
+	auto            it       = Graphics::g_gpu_write_ranges.upper_bound(vaddr);
+	for (int steps = 0; steps < 64 && it != Graphics::g_gpu_write_ranges.begin(); steps++) {
+		--it;
+		if (it->first <= vaddr && vaddr < it->first + it->second.first) {
+			writer = it->second.second;
+			break;
+		}
+	}
+	writers[writer]++;
+	pairs[{Graphics::g_srt_reader, writer}]++;
+	if (total < 48) {
+		uint32_t words[4] = {};
+		std::memcpy(words, data, std::min<uint64_t>(size, sizeof(words)));
+		std::fprintf(stderr,
+		             "[srtsample] %016llx size %llu reader %016llx writer %016llx: %08x %08x %08x %08x\n",
+		             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+		             static_cast<unsigned long long>(Graphics::g_srt_reader),
+		             static_cast<unsigned long long>(writer), words[0], words[1], words[2], words[3]);
+	}
+	sizes[size <= 16 ? 0 : size <= 64 ? 1 : size <= 1024 ? 2 : 3]++;
+	uint64_t hash = 1469598103934665603ull;
+	for (uint64_t i = 0; i < size; i++) {
+		hash = (hash ^ static_cast<const uint8_t*>(data)[i]) * 1099511628211ull;
+	}
+	auto [entry, inserted] = last_hash.try_emplace({vaddr, size}, hash);
+	if (inserted) {
+		first++;
+	} else {
+		(entry->second == hash ? unchanged : changed)++;
+		entry->second = hash;
+	}
+	if (++total % 1024 != 0) {
+		return;
+	}
+	std::fprintf(stderr,
+	             "[srtdiag] %llu readback reads: size <=16 %llu, <=64 %llu, <=1K %llu, >1K %llu; "
+	             "vs last read of the same range: unchanged %llu, changed %llu, first %llu\n",
+	             static_cast<unsigned long long>(total), static_cast<unsigned long long>(sizes[0]),
+	             static_cast<unsigned long long>(sizes[1]), static_cast<unsigned long long>(sizes[2]),
+	             static_cast<unsigned long long>(sizes[3]), static_cast<unsigned long long>(unchanged),
+	             static_cast<unsigned long long>(changed), static_cast<unsigned long long>(first));
+	std::vector<std::pair<uint64_t, uint64_t>> top(writers.begin(), writers.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	for (size_t i = 0; i < std::min<size_t>(top.size(), 5); i++) {
+		std::fprintf(stderr, "[srtdiag]   writer cs %016llx: %llu reads\n",
+		             static_cast<unsigned long long>(top[i].first),
+		             static_cast<unsigned long long>(top[i].second));
+	}
+	std::vector<std::pair<std::pair<uint64_t, uint64_t>, uint64_t>> top_pairs(pairs.begin(), pairs.end());
+	std::sort(top_pairs.begin(), top_pairs.end(),
+	          [](const auto& a, const auto& b) { return a.second > b.second; });
+	for (size_t i = 0; i < std::min<size_t>(top_pairs.size(), 10); i++) {
+		std::fprintf(stderr, "[srtdiag]   reader %016llx <- writer %016llx: %llu reads\n",
+		             static_cast<unsigned long long>(top_pairs[i].first.first),
+		             static_cast<unsigned long long>(top_pairs[i].first.second),
+		             static_cast<unsigned long long>(top_pairs[i].second));
+	}
+	std::fflush(stderr);
+}
+
+bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return false;
+		}
+		if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+			static uint64_t declined = 0;
+			if (++declined % 4096 == 0) {
+				std::fprintf(stderr, "[srtbranch] %llu GPU-written branch-condition reads declined\n",
+				             static_cast<unsigned long long>(declined));
+				std::fflush(stderr);
+			}
+			return false;
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+bool TryReadCleanBackingOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	return Graphics::GuestGpu::IsGpuThread() && TryReadCleanBufferBacking(vaddr, data, size);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	bool diag_readback = false;
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
@@ -866,9 +958,15 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
+			diag_readback = true;
+			Graphics::g_srt_readbacks++;
 		}
 	}
-	return TryReadBacking(vaddr, data, size);
+	const bool result = TryReadBacking(vaddr, data, size);
+	if (diag_readback && result) {
+		SrtReadDiag(vaddr, size, data);
+	}
+	return result;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -884,8 +982,42 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",
 		     vaddr, size, clamped_size);
+		// Diagnostic (uncommitted): also on stderr, which survives Silent printf (#1288 question).
+		std::fprintf(stderr,
+		             "[clampdiag] Memory: clamped buffer range addr=0x%016" PRIx64
+		             " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n",
+		             vaddr, size, clamped_size);
+		std::fflush(stderr);
 	}
 	return clamped_size;
+}
+
+void WriteBackingSkipHoles(uint64_t vaddr, const void* data, uint64_t size) {
+	if (TryWriteBacking(vaddr, data, size)) {
+		return;
+	}
+	// Experiment (uncommitted): upstream e5f0ee7f stopped clamping finite buffer ranges to mapped
+	// memory, so a GPU-written buffer can cover unmapped holes. Before, this EXITed (run 42).
+	constexpr uint64_t page    = 0x1000;
+	uint64_t           skipped = 0;
+	for (uint64_t current = vaddr; current < vaddr + size;) {
+		const uint64_t next = std::min(vaddr + size, (current & ~(page - 1)) + page);
+		if (!TryWriteBacking(current, static_cast<const uint8_t*>(data) + (current - vaddr),
+		                     next - current)) {
+			skipped += next - current;
+		}
+		current = next;
+	}
+	static std::atomic<uint64_t> events {0};
+	const auto                   n = events.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 16 || n % 256 == 0) {
+		std::fprintf(stderr,
+		             "[holediag] #%llu GPU download into unbacked memory: addr=0x%016llx size=0x%llx "
+		             "skipped 0x%llx bytes\n",
+		             static_cast<unsigned long long>(n), static_cast<unsigned long long>(vaddr),
+		             static_cast<unsigned long long>(size), static_cast<unsigned long long>(skipped));
+		std::fflush(stderr);
+	}
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {

@@ -668,6 +668,31 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// Experiment (uncommitted, KYTY_FAULT_EMULATE=1, instructions 8.24): a GPU-thread read of
+		// bytes the GPU did not write is emulated from the backing memory. The normal path would
+		// download every GPU-written byte of the 4 KiB page and drain the GPU first (false sharing).
+		static const bool fault_emulate = [] {
+			const char* value = std::getenv("KYTY_FAULT_EMULATE");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (fault_emulate && access == GpuAccess::Read) {
+			static std::atomic<uint64_t> attempts {0};
+			static std::atomic<uint64_t> emulated {0};
+			const auto tried = attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+			const bool done  = Loader::X64InstructionEmulator::TryEmulateLoad(
+			    info->native_context, info->access_violation_vaddr,
+			    Libs::LibKernel::Memory::TryReadCleanBackingOnGpuThread);
+			const auto served = emulated.fetch_add(done ? 1 : 0, std::memory_order_relaxed) +
+			                    (done ? 1 : 0);
+			if (tried % 4096 == 0) {
+				std::fprintf(stderr, "[faultemu] %llu read faults, %llu emulated without a GPU sync\n",
+				             static_cast<unsigned long long>(tried),
+				             static_cast<unsigned long long>(served));
+			}
+			if (done) {
+				return true;
+			}
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;

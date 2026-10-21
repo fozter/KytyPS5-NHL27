@@ -131,8 +131,16 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// GPU download publication: writes the backed pages and skips holes (sparse PRT ranges, memory
+// unmapped since the download was recorded), which no guest read can reach.
+void                   WriteBackingSkipHoles(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Like TryReadBufferBacking, but refuses bytes the GPU wrote instead of waiting for them.
+bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// TryReadCleanBufferBacking for the GPU thread's fault emulation only (KYTY_FAULT_EMULATE=1):
+// declines on every other thread, whatever the address.
+bool                   TryReadCleanBackingOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
