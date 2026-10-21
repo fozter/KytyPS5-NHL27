@@ -356,7 +356,7 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
+	static constexpr uint32_t        MeshDrawDwordCount = 7;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -657,6 +657,9 @@ struct ResourcePlan {
 		};
 
 		std::vector<Entry> values;
+		// Indices marked unknown (generation | 2) in this generation, so ResetUnknowns clears
+		// only them instead of scanning every value (uncommitted perf change).
+		std::vector<uint32_t> unknowns;
 		uint64_t           generation = 0;
 		const SrtWalker*    session = nullptr;
 		Value              active_mask;
@@ -675,7 +678,7 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
-	std::list<Inst>                     value_storage;
+	Block::InstructionList              value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<uint32_t>               selector_groups;
@@ -690,6 +693,14 @@ struct ResourcePlan {
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	// Perf (uncommitted): per SRT read slot, the plan-constant parts of its refresh (clean flag,
+	// evaluation index of its value), filled on first use by SrtWalker::RefreshFlatBuffer.
+	struct SrtReadSlotCache {
+		uint32_t evaluation_index = UINT32_MAX;
+		bool     clean            = false;
+		bool     prepared         = false;
+	};
+	mutable std::vector<SrtReadSlotCache> srt_read_cache;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
@@ -699,6 +710,112 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// Perf (uncommitted, SRT reachability memo): the inputs (in evaluation order) of the last
+	// control-flow reachability pass and its visited-set result, so a repeat with identical
+	// inputs skips the fixpoint entirely. GPU-thread only (MaterializeResources runs on the
+	// command thread).
+	struct SrtMemoRead {
+		uint32_t kind;    // 0 user data, 1 ordinary raw, 2 strict raw, 3 ordinary declined, 4 strict declined, 5 direct host raw, 6 user data out of range
+		uint32_t index;   // user-data dword (kinds 0/6)
+		uint64_t address; // raw read address (kinds 1-5)
+		uint32_t value;   // observed dword (kinds 0/1/2/5)
+	};
+	struct SrtReachabilityMemo {
+		std::vector<SrtMemoRead> reads;
+		std::vector<uint8_t>     visited;
+		uint64_t                 shader_base = 0;
+		bool                     valid       = false;
+	};
+	mutable SrtReachabilityMemo srt_reachability_memo;
+	// Perf (uncommitted, per-block condition cache): a control-flow branch
+	// condition whose only inputs are user-data dwords and the shader base can
+	// be skipped outright when those inputs repeat (idea: pengui07's
+	// DirectCfCondition). Conditions with any other leaf (raw reads, Phi, ...)
+	// are never cached here.
+	struct SrtCfLeaf {
+		uint32_t kind  = 0; // 0 = user data, 1 = shader base, 2 = flat word (walk-fetched)
+		uint32_t index = 0;
+	};
+	struct SrtCfCondition {
+		std::vector<SrtCfLeaf> leaves;
+		std::vector<uint64_t>  last_values;
+		uint32_t               last_result = 0;
+		uint8_t                classified  = 0; // 0 = pending, 1 = cacheable, 2 = not cacheable
+		bool                   has_last    = false;
+	};
+	mutable std::vector<SrtCfCondition> srt_cf_conditions;
+	// Perf (uncommitted, direct control-flow walk, after pengui07): one-level
+	// direct reads (address = user-data register pair + fixed dword offset),
+	// batched runs per block, and the walk's data-first ordering that makes
+	// branch conditions comparable against words the walk has already fetched.
+	struct SrtDirectRead {
+		uint32_t low_register     = 0;
+		uint32_t high_register    = 0;
+		int32_t  relative         = 0;
+		uint32_t evaluation_index = 0;
+		bool     clean            = false;
+		bool     valid            = false;
+	};
+	mutable std::vector<SrtDirectRead> srt_direct_reads;
+	struct SrtCfRun {
+		uint32_t slot  = 0;
+		uint32_t count = 0;
+	};
+	mutable std::vector<SrtCfRun>     srt_cf_runs;
+	mutable std::vector<uint32_t>     srt_cf_run_begin;
+	mutable std::vector<uint8_t>      srt_cf_entry_active;
+	mutable std::vector<uint8_t>      srt_cf_filled;
+	mutable uint8_t                   srt_direct_state = 0; // 0 pending, 1 built, 2 unsupported
+	// Perf (uncommitted, §8.26 dense evaluator): the control-flow walk's
+	// expression graph compiled once into a compact node array; DenseWalker
+	// (SrtWalker.cpp) runs the SAME lazy algorithm on it. GPU-thread only.
+	static constexpr uint32_t kDenseNoNode = UINT32_MAX;
+	enum : uint16_t {
+		kDenseImm            = 0x100, // flags = Type, imm64 = Value::operator== bits
+		kDenseFail,                  // the old evaluator's "return false" forms
+		kDensePhiControl,            // imm = offset into the phi side arrays
+		kDensePhiInvariant,          // args[0] = the invariant phi's resolved node
+		kDenseRawRead,               // imm = memory_info index; see DenseWalker
+		kDenseExtractU64,            // args[0] = packed value, imm = component
+		kDenseExtractConstruct,     // args[0] = the construct's selected operand
+		kDenseExtractCarry,          // args[0]/args[1] = carry operands, imm = component
+	};
+	// Raw-read flag bits (kDenseRawRead).
+	static constexpr uint8_t kDenseReadVector   = 1u << 0u;
+	static constexpr uint8_t kDenseReadConstBuf = 1u << 1u;
+	static constexpr uint8_t kDenseReadClean    = 1u << 2u;
+	static constexpr uint8_t kDenseReadHandle4  = 1u << 3u;
+	static constexpr uint8_t kDenseFlushDenorms = 1u << 4u;
+	struct DenseNode {
+		uint16_t opcode;   // a ValueOpcode or a kDense* pseudo-opcode
+		uint8_t  num_args; // used argument slots (Phi: its argument count)
+		uint8_t  flags;    // kDense* bits / the immediate's Type
+		uint32_t imm;      // payload: reg index, memory_info index, component, phi offset
+		uint64_t imm64;    // kDenseImm comparison bits; FP flush flag source otherwise
+		uint32_t args[6];  // dense node indices; kDenseNoNode = unused
+	};
+	mutable std::vector<DenseNode>   dense_nodes;
+	mutable std::vector<uint32_t>   dense_phi_args;        // flat: Phi operand nodes
+	mutable std::vector<uint32_t>   dense_phi_preds;       // flat: per-operand predecessor block
+	mutable std::vector<uint32_t>   dense_block_conditions; // per control block; kDenseNoNode = empty
+	mutable std::vector<uint32_t>   dense_slot_nodes;       // per SRT read slot: root node
+	mutable std::vector<uint8_t>    dense_slot_clean;       // per SRT read slot: clean flag
+	mutable uint8_t                 dense_state = 0;        // 0 pending, 1 compiled, 2 unsupported
+	// The dense walker's memo pool (same generation/unknowns mechanics as
+	// EvaluationContext, keyed by dense node index and mask node).
+	struct DenseContext {
+		struct Entry {
+			uint64_t value      = 0;
+			uint64_t generation = 0;
+		};
+		std::vector<Entry>   values;
+		std::vector<uint32_t> unknowns;
+		uint64_t             generation       = 0;
+		const void*          session          = nullptr;
+		uint32_t             active_mask_node = kDenseNoNode;
+		uint8_t              read_policy      = 0;
+	};
+	mutable std::deque<DenseContext> dense_contexts;
 };
 
 struct Program: ResourcePlan {
@@ -735,6 +852,8 @@ std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
+// Diagnostic (uncommitted): total ValidateProgram time of the session, in ms.
+inline double g_diag_validate_ms = 0.0;
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,

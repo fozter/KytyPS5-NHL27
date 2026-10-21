@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -10,9 +11,12 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
+#include <string_view>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -149,9 +153,12 @@ bool ValidatePackedUnormSampling(const ResourcePlan& program, const ResourceSnap
 	return true;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer };
+enum class SamplerClass : uint8_t { Float, Integer, Compare };
 
 SamplerClass ClassifySampler(const ImageResource& image) {
+	if (image.depth_compare) {
+		return SamplerClass::Compare;
+	}
 	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
 	               image.numeric_class == Prospero::TextureNumericClass::Sint
 	           ? SamplerClass::Integer : SamplerClass::Float;
@@ -834,7 +841,7 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::vector<std::array<uint32_t, 2>> mapping;
+	std::vector<std::array<uint32_t, 3>> mapping;
 	std::vector<Binding>                bindings;
 };
 
@@ -1534,8 +1541,167 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+// Profiling (uncommitted): consecutive phases of MaterializeResources as Tracy zones.
+namespace {
+struct MatPhase {
+	std::optional<tracy::ScopedZone> zone;
+	void Enter(const tracy::SourceLocationData* location) {
+		zone.reset();
+		zone.emplace(location, TRACY_CALLSTACK, tracy::ProfilerAvailable());
+	}
+};
+} // namespace
+#define KYTY_MAT_PHASE(phase, name)                                                                  \
+	do {                                                                                           \
+		static constexpr tracy::SourceLocationData location {name, TracyFunction, TracyFile,       \
+		                                                     static_cast<uint32_t>(__LINE__), 0}; \
+		(phase).Enter(&location);                                                                \
+	} while (false)
+
+static bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot&      snapshot,
+                                     ResourceSpecialization& specialization);
+
+// Dense evaluator verification (uncommitted, §8.26, KYTY_SRT_DENSE_VERIFY=full): every refresh of a
+// control-flow plan runs once with the dense walk into scratch copies and then with the old walk,
+// which is authoritative and runs last so the plan's scratch state is its own. Every output is
+// compared, including the captured specialization-read ranges (the read certificate).
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	static const bool full_verify = [] {
+		const char* value = std::getenv("KYTY_SRT_DENSE_VERIFY");
+		return value != nullptr && std::string_view(value) == "full";
+	}();
+	if (!full_verify || program.control_flow.empty() || g_srt_dense_override >= 0) {
+		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	}
+	const ResourceSnapshot       input_snapshot       = snapshot;
+	const ResourceSpecialization input_specialization = specialization;
+	ResourceSnapshot             dense_snapshot       = snapshot;
+	ResourceSpecialization       dense_specialization = specialization;
+	const auto                   declines_before      = g_srt_branch_declines;
+	g_srt_dense_override = 1;
+	const bool dense_ok =
+	    MaterializeResourcesOnce(program, runtime, dense_snapshot, dense_specialization);
+	const auto dense_declines = g_srt_branch_declines - declines_before;
+	g_srt_dense_override = 0;
+	bool       ok            = MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	const auto old_declines  = g_srt_branch_declines - declines_before - dense_declines;
+	g_srt_dense_override = -1;
+	static uint64_t checked = 0, mismatched = 0;
+	checked++;
+	const auto read_set = [](const ResourceSnapshot& from) {
+		auto set = from.specialization_reads;
+		std::sort(set.begin(), set.end());
+		set.erase(std::unique(set.begin(), set.end()), set.end());
+		return set;
+	};
+	const char* field = nullptr;
+	if (dense_ok != ok) {
+		field = "success";
+	} else if (ok) {
+		if (dense_snapshot.flattened_srt != snapshot.flattened_srt) {
+			field = "flattened_srt";
+		} else if (dense_snapshot.buffers != snapshot.buffers) {
+			field = "buffers";
+		} else if (dense_snapshot.images != snapshot.images) {
+			field = "images";
+		} else if (dense_snapshot.samplers != snapshot.samplers) {
+			field = "samplers";
+		} else if (dense_snapshot.user_data != snapshot.user_data) {
+			field = "user_data";
+		} else if (dense_snapshot.uniform_fill != snapshot.uniform_fill) {
+			field = "uniform_fill";
+		} else if (dense_snapshot.specialization_reads != snapshot.specialization_reads) {
+			// The reads are consumed as a set of ranges (overlap checks against written
+			// resources): duplicates are harmless, a range in only one of them is not.
+			const auto      dense_set = read_set(dense_snapshot);
+			const auto      old_set   = read_set(snapshot);
+			static uint64_t duplicate_only = 0;
+			if (dense_set == old_set) {
+				if ((++duplicate_only & 0xfffu) == 1u) {
+					std::fprintf(stderr,
+					             "[denseverify-full] %llu refreshes with the same read set, different "
+					             "duplicates (harmless)\n",
+					             static_cast<unsigned long long>(duplicate_only));
+				}
+			} else {
+				field = "specialization_reads (set)";
+				std::vector<std::pair<uint64_t, uint64_t>> only_dense, only_old;
+				std::set_difference(dense_set.begin(), dense_set.end(), old_set.begin(), old_set.end(),
+				                    std::back_inserter(only_dense));
+				std::set_difference(old_set.begin(), old_set.end(), dense_set.begin(), dense_set.end(),
+				                    std::back_inserter(only_old));
+				std::fprintf(stderr, "[denseverify-full]   %zu ranges only dense, %zu only old\n",
+				             only_dense.size(), only_old.size());
+				for (size_t i = 0; i < std::min<size_t>(only_dense.size(), 4); ++i) {
+					std::fprintf(stderr, "[denseverify-full]   only dense: 0x%llx+0x%llx\n",
+					             static_cast<unsigned long long>(only_dense[i].first),
+					             static_cast<unsigned long long>(only_dense[i].second));
+				}
+				for (size_t i = 0; i < std::min<size_t>(only_old.size(), 4); ++i) {
+					std::fprintf(stderr, "[denseverify-full]   only old: 0x%llx+0x%llx\n",
+					             static_cast<unsigned long long>(only_old[i].first),
+					             static_cast<unsigned long long>(only_old[i].second));
+				}
+			}
+		}
+		if (field == nullptr && !(dense_specialization == specialization)) {
+			field = "specialization";
+		}
+	}
+	if (field != nullptr && ++mismatched <= 32u) {
+		std::fprintf(stderr,
+		             "[denseverify-full] MISMATCH #%llu in %s: shader %016llx, dense ok %d, old ok "
+		             "%d, read ranges dense %zu / old %zu\n",
+		             static_cast<unsigned long long>(mismatched), field,
+		             static_cast<unsigned long long>(program.shader_hash), dense_ok ? 1 : 0,
+		             ok ? 1 : 0, dense_snapshot.specialization_reads.size(),
+		             snapshot.specialization_reads.size());
+		// Order check: a branch-condition read declined because its bytes were GPU-written can
+		// succeed in the later walk once a strict read in between has downloaded them, so the walk
+		// order alone can change the reads. Rerun dense, then old last again (authoritative).
+		const auto first_old_set        = read_set(snapshot);
+		ResourceSnapshot       rerun_snapshot       = input_snapshot;
+		ResourceSpecialization rerun_specialization = input_specialization;
+		const auto             rerun_before         = g_srt_branch_declines;
+		g_srt_dense_override = 1;
+		const bool rerun_dense_ok =
+		    MaterializeResourcesOnce(program, runtime, rerun_snapshot, rerun_specialization);
+		const auto rerun_dense_declines = g_srt_branch_declines - rerun_before;
+		g_srt_dense_override = 0;
+		snapshot             = input_snapshot;
+		specialization       = input_specialization;
+		ok                   = MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+		const auto rerun_old_declines = g_srt_branch_declines - rerun_before - rerun_dense_declines;
+		g_srt_dense_override = -1;
+		std::fprintf(stderr,
+		             "[denseverify-full]   declined branch reads: dense %llu, old %llu | rerun: dense ok "
+		             "%d declined %llu, old ok %d declined %llu, dense set == old set %d, old set "
+		             "unchanged %d, rerun flat equal %d\n",
+		             static_cast<unsigned long long>(dense_declines),
+		             static_cast<unsigned long long>(old_declines), rerun_dense_ok ? 1 : 0,
+		             static_cast<unsigned long long>(rerun_dense_declines), ok ? 1 : 0,
+		             static_cast<unsigned long long>(rerun_old_declines),
+		             read_set(rerun_snapshot) == read_set(snapshot) ? 1 : 0,
+		             first_old_set == read_set(snapshot) ? 1 : 0,
+		             rerun_snapshot.flattened_srt == snapshot.flattened_srt ? 1 : 0);
+		std::fflush(stderr);
+	}
+	if ((checked & 0xffffu) == 0u) {
+		std::fprintf(stderr, "[denseverify-full] %llu control-flow refreshes checked, %llu mismatches\n",
+		             static_cast<unsigned long long>(checked),
+		             static_cast<unsigned long long>(mismatched));
+		std::fflush(stderr);
+	}
+	return ok;
+}
+
+static bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot&      snapshot,
+                                     ResourceSpecialization& specialization) {
+	MatPhase phase;
+	KYTY_MAT_PHASE(phase, "Mat:WalkSetup");
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
@@ -1555,7 +1721,45 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+	// Diagnostic (uncommitted): which walk kind runs, as separate zones and counters.
+	const bool jit_ok       = program.srt_code != nullptr && observed.read_memory == nullptr;
+	const bool jit_captured = program.srt_code != nullptr && observed.read_memory != nullptr;
+	const bool has_cf       = !program.control_flow.empty();
+	if (jit_ok) {
+		KYTY_MAT_PHASE(phase, "Mat:WalkJit");
+	} else if (jit_captured) {
+		KYTY_MAT_PHASE(phase, "Mat:WalkInterpJitBlockedByCapture");
+	} else if (has_cf) {
+		KYTY_MAT_PHASE(phase, "Mat:WalkInterpControlFlow");
+	} else {
+		KYTY_MAT_PHASE(phase, "Mat:WalkInterpOther");
+	}
+	{
+		static uint64_t calls = 0, jit = 0, blocked = 0, cf = 0, other = 0, reads = 0, captured = 0,
+		                program_capture = 0, source_reads = 0;
+		calls++;
+		reads += program.srt_reads.size();
+		(jit_ok ? jit : jit_captured ? blocked : has_cf ? cf : other)++;
+		captured += capture_reads ? 1 : 0;
+		program_capture += program.capture_specialization_reads ? 1 : 0;
+		source_reads += program.source_reads.empty() ? 0 : 1;
+		if (calls % (1u << 20u) == 0) {
+			std::fprintf(stderr,
+			             "[walkkind] %llu walks: JIT %llu, interp (JIT blocked by read capture) %llu, "
+			             "interp (control flow) %llu, interp (other) %llu | capture %llu (plan flag "
+			             "%llu, source reads %llu) | avg %.1f SRT reads\n",
+			             static_cast<unsigned long long>(calls), static_cast<unsigned long long>(jit),
+			             static_cast<unsigned long long>(blocked), static_cast<unsigned long long>(cf),
+			             static_cast<unsigned long long>(other), static_cast<unsigned long long>(captured),
+			             static_cast<unsigned long long>(program_capture),
+			             static_cast<unsigned long long>(source_reads),
+			             static_cast<double>(reads) / static_cast<double>(calls));
+			std::fflush(stderr);
+		}
+	}
+	const bool refreshed = walker.RefreshFlatBuffer(snapshot.flattened_srt);
+	KYTY_MAT_PHASE(phase, "Mat:WalkAfter");
+	if (!refreshed) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
@@ -1607,6 +1811,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
 		    kind, resource, source, candidates));
 	};
+	KYTY_MAT_PHASE(phase, "Mat:Buffers");
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1658,6 +1863,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+	KYTY_MAT_PHASE(phase, "Mat:Images");
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1704,6 +1910,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	KYTY_MAT_PHASE(phase, "Mat:Samplers");
 	snapshot.samplers.resize(program.info.samplers.size());
 	specialization.samplers.assign(program.info.samplers.size(), {});
 	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
@@ -1741,6 +1948,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	KYTY_MAT_PHASE(phase, "Mat:BuildSpecialization");
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
@@ -1837,7 +2045,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::Integer;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		samplers[index].integer_border        = binding.type == SamplerClass::Integer;
+		samplers[index].depth_compare         = binding.type == SamplerClass::Compare;
 	}
 	for (uint32_t index = 0; index < sampler_plan.bindings.size(); index++) {
 		const auto& binding = sampler_plan.bindings[index];

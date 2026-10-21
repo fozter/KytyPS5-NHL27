@@ -27,11 +27,12 @@ public:
 	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
 	    m_source(source), m_ranges(ranges) {}
 	SrtRuntime ObservedRuntime();
-
-private:
+	// The dense evaluator's verification (uncommitted, §8.26) replays a walk without capturing.
+	[[nodiscard]] const SrtRuntime& Source() const { return m_source; }
 	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
 	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
 
+private:
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
 };
@@ -53,6 +54,17 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+
+// Diagnostic (uncommitted): 1 while a control-flow condition is evaluated for reachability (an
+// unknown condition there keeps both successors), 0 otherwise.
+inline thread_local int g_srt_read_role = 0;
+// Diagnostic (uncommitted, §8.26): branch-condition reads declined because their bytes are
+// GPU-written (KYTY_SRT_BRANCH_BOTH); the dense verification reports them per walk.
+inline thread_local uint64_t g_srt_branch_declines = 0;
+
+// Dense evaluator (uncommitted, §8.26): -1 = KYTY_SRT_DENSE decides; 0/1 = force the old / dense
+// control-flow walk (MaterializeResources' full verification runs each once).
+inline thread_local int g_srt_dense_override = -1;
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
@@ -109,6 +121,10 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// Perf (uncommitted, direct control-flow walk): data-first single pass over
+	// the blocks; conditions compare against words this walk already fetched.
+	// False = fall back to the fixpoint walk.
+	bool RefreshDirectControlFlow(std::vector<uint32_t>& flat);
 
 private:
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
@@ -122,6 +138,9 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// EvaluateWide's memo hit by a precomputed evaluation index, without touching the
+	// instruction (only for walkers without an active mask).
+	bool TryMemoized(uint32_t index, uint32_t& result) const;
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -130,6 +149,10 @@ private:
 	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
+	// Perf (uncommitted): the session's own contexts by (active mask, read policy), so child
+	// walkers (a pair per ReadFirstLane evaluation) do not scan every context of the plan.
+	// Declared before m_context: AcquireContext runs in the member initializers.
+	mutable std::vector<std::tuple<Value, uint8_t, ResourcePlan::EvaluationContext*>> m_context_index;
 	ResourcePlan::EvaluationContext& m_context;
 };
 

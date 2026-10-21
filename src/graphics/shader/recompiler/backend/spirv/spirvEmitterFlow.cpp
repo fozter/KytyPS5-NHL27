@@ -752,10 +752,50 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                                ConstantU32(state, 0));
 }
 
+// Fragment subgroups can lack lanes a guest wave has (helper pixels that skip subgroup
+// operations, partially filled warps). Values cannot be fetched from such lanes.
+static bool MayLackLanes(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel;
+}
+
+static uint32_t EmitLanePresent(ValueEmitContext& ctx, uint32_t lane) {
+	return EmitBallotLaneActiveBool(ctx.state, ctx.Ballot(IR::Value(true)), lane);
+}
+
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
-	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
+	auto       write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	// DPP16 with FI=0 and BOUND_CTRL=0 leaves the destination unwritten for a disabled source
+	// lane; DPP8 has no BOUND_CTRL and reads such lanes as zero.
+	const bool gate_inactive = !flags.dpp8 && !flags.fetch_inactive && !flags.bound_control;
+	if (!gate_inactive && !MayLackLanes(state)) {
+		return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
+		                                                ctx.Arg(inst, 1));
+	}
+	const auto target = EmitDppTargetLane(state, flags);
+	if (gate_inactive) {
+		const auto source_active =
+		    EmitBallotLaneActiveBool(state, ctx.Ballot(inst.Arg(2)), target.lane);
+		const auto gated = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), gated, write,
+		                          source_active);
+		write = gated;
+	}
+	if (!MayLackLanes(state)) {
+		return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
+		                                                ctx.Arg(inst, 1));
+	}
+	// A source lane the host subgroup does not have also leaves the destination unwritten, so
+	// wave reductions (min/max/add scans) skip it instead of mixing in undefined data or zero.
+	const auto present   = EmitLanePresent(ctx, target.lane);
+	const auto invalid   = state.builder.AllocateId();
+	const auto fetchable = state.builder.AllocateId();
+	const auto gated     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), invalid, target.valid);
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), fetchable, invalid, present);
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), gated, write, fetchable);
+	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, gated, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }
 
@@ -790,7 +830,28 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	auto lane = ctx.Arg(inst, 1);
+	if (ctx.other_half == nullptr && ctx.state.program.wave_size == 64u) {
+		// A wave64 program on a narrower host subgroup (e.g. a pixel shader on 32-wide NVIDIA
+		// subgroups) can name lanes the subgroup does not have, and shuffling from those is
+		// undefined. Read the matching lane of the host subgroup so V_READLANE_B32 s, v, 63
+		// after a row/half reduction returns that reduction instead of garbage.
+		const auto mask = EmitBinaryU32(ctx.state, spv::OpISub, EmitSubgroupSize(ctx.state),
+		                                ConstantU32(ctx.state, 1));
+		lane            = EmitBinaryU32(ctx.state, spv::OpBitwiseAnd, lane, mask);
+	}
+	if (ctx.other_half == nullptr && MayLackLanes(ctx.state)) {
+		// The named lane may not exist in the host subgroup (helper pixel, partial warp). Read
+		// the highest lane that does, which holds the widest prefix of a row/half reduction.
+		auto&      state   = ctx.state;
+		const auto present = EmitLanePresent(ctx, lane);
+		const auto highest = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindMSB, TypeU32(state), highest,
+		                          ConstantU32(state, spv::ScopeSubgroup),
+		                          ctx.Ballot(IR::Value(true)));
+		lane = EmitNative<spv::OpSelect, IR::Type::U32>(state, present, lane, highest);
+	}
+	return ctx.Shuffle(inst, 0, lane);
 }
 
 uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -801,6 +862,32 @@ uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
+	return result;
+}
+
+/// Emit an unsigned maximum reduction, combining both emulated wave halves first.
+uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	auto value = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		value = EmitUMax32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMax, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
+	return result;
+}
+
+/// Emit a bitwise OR reduction, combining both emulated wave halves first.
+uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	auto value = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		value = EmitBitwiseOr32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBitwiseOr, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
 	return result;
 }
@@ -853,12 +940,22 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto shuffled = ctx.Shuffle(inst, 0, target);
 	uint32_t   result   = shuffled;
 	if (!flags.fetch_inactive) {
-		const auto source_exec = ctx.Shuffle(inst, 3, target);
-		result                 = state.builder.AllocateId();
+		// Shuffling the EXEC bit from a lane the subgroup lacks is undefined; read its ballot bit.
+		const auto source_exec =
+		    MayLackLanes(state)
+		        ? EmitBallotLaneActiveBool(state, ctx.Ballot(inst.Arg(3)), target)
+		        : ctx.Shuffle(inst, 3, target);
+		result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
 		                          ConstantU32(state, 0));
 	}
-	return result;
+	if (!MayLackLanes(state)) {
+		return result;
+	}
+	// A source lane the host subgroup does not have yields the caller's own value, which keeps
+	// min/max/and/or reductions across the row halves from picking up zero or undefined data.
+	return EmitNative<spv::OpSelect, IR::Type::U32>(state, EmitLanePresent(ctx, target), result,
+	                                                ctx.Arg(inst, 0));
 }
 
 uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {

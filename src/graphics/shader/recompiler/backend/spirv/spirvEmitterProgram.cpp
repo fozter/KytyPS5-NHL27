@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <type_traits>
@@ -230,12 +231,13 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+/// Dispatch an IR instruction, sharing whole-wave results between emulated halves.
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	using Op = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
-	     op == Op::ReadConstBuffer ||
+	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 || op == Op::ReadConstBuffer ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Whole-wave results and SMEM loads (SGPR operands, no EXEC) are identical in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
@@ -347,9 +349,70 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	PatchStructuredPhis(ctx, structured);
 }
 
+// Local diagnostic: KYTY_DISPATCHER_GUARD=<n>[d] ends a pixel shader's dispatcher loop after n
+// block steps, so a runaway state machine cannot hang the GPU. The pixel is discarded, or with the
+// "d" suffix painted into MRT0: R = block id it stopped at / 255, G = backward jumps / 255, B = 1.
+struct DispatcherGuard {
+	uint32_t limit = 0;
+	bool     paint = false;
+};
+
+DispatcherGuard DispatcherGuardConfig() {
+	static const DispatcherGuard guard = [] {
+		DispatcherGuard result;
+		if (const char* value = std::getenv("KYTY_DISPATCHER_GUARD"); value != nullptr) {
+			char* end    = nullptr;
+			result.limit = static_cast<uint32_t>(std::strtoul(value, &end, 10));
+			result.paint = end != nullptr && *end == 'd';
+		}
+		return result;
+	}();
+	return guard;
+}
+
+void EmitDispatcherGuardPaint(EmitterState& state, uint32_t tripped, uint32_t pc, uint32_t back) {
+	const auto output =
+	    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 0});
+	if (output == 0 || state.input_info.pixel->target_output_mode[0] == 7u) {
+		return;
+	}
+	const auto scale   = ConstantF32Value(state, 1.0f / 255.0f);
+	const auto one     = ConstantF32Value(state, 1.0f);
+	const auto to_unit = [&](uint32_t value) {
+		const auto below   = state.builder.AllocateId();
+		const auto clamped = state.builder.AllocateId();
+		const auto as_f32  = state.builder.AllocateId();
+		const auto scaled  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), below, value,
+		                          ConstantU32(state, 255));
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), clamped, below, value,
+		                          ConstantU32(state, 255));
+		state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), as_f32, clamped);
+		state.builder.AddFunction(spv::OpFMul, TypeF32(state), scaled, as_f32, scale);
+		return scaled;
+	};
+	const auto red     = to_unit(pc);
+	const auto green   = to_unit(back);
+	const auto color   = state.builder.AllocateId();
+	const auto current = state.builder.AllocateId();
+	const auto mask    = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), color, red, green,
+	                          one, one);
+	state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), current, output);
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4), mask, tripped,
+	                          tripped, tripped, tripped);
+	state.builder.AddFunction(spv::OpSelect, TypeF32Vector(state, 4), value, mask, color, current);
+	state.builder.AddFunction(spv::OpStore, output, value);
+}
+
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
-	auto&       state = ctx.state;
-	const auto* entry = state.program.blocks.front();
+	auto&       state       = ctx.state;
+	const auto  guard       = state.program.stage == ShaderType::Pixel ? DispatcherGuardConfig()
+	                                                                   : DispatcherGuard {};
+	const auto  guard_limit = guard.limit;
+	const bool  paint       = guard_limit != 0 && guard.paint;
+	const auto* entry       = state.program.blocks.front();
 	state.builder.AddFunction(spv::OpBranch, entry->Definition());
 	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 		EmitDispatcherInstruction(lane, dispatcher, inst);
@@ -364,9 +427,29 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
+	const auto step      = guard_limit != 0 ? state.builder.AllocateId() : 0u;
+	const auto next_step = guard_limit != 0 ? state.builder.AllocateId() : 0u;
+	const auto tripped   = guard_limit != 0 ? state.builder.AllocateId() : 0u;
+	const auto back      = paint ? state.builder.AllocateId() : 0u;
+	const auto next_back = paint ? state.builder.AllocateId() : 0u;
+	if (guard_limit != 0) {
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), step, ConstantU32(state, 0),
+		                          initial_parent, next_step, dispatcher.continue_label);
+	}
+	if (paint) {
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), back, ConstantU32(state, 0),
+		                          initial_parent, next_back, dispatcher.continue_label);
+	}
+	auto done = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	if (guard_limit != 0) {
+		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), tripped, step,
+		                          ConstantU32(state, guard_limit));
+		const auto either = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), either, done, tripped);
+		done = either;
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -399,8 +482,31 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
+	if (guard_limit != 0) {
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_step, step,
+		                          ConstantU32(state, 1));
+	}
+	if (paint) {
+		const auto backward = state.builder.AllocateId();
+		const auto added    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), backward, next_pc, pc);
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), added, backward,
+		                          ConstantU32(state, 1), ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_back, back, added);
+	}
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
+	if (paint) {
+		EmitDispatcherGuardPaint(state, tripped, pc, back);
+	} else if (guard_limit != 0 && state.pixel_valid_mask_variable != 0) {
+		const auto mask = state.builder.AllocateId();
+		const auto kept = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), mask,
+		                          state.pixel_valid_mask_variable);
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), kept, tripped,
+		                          ConstantU32(state, 0), mask);
+		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable, kept);
+	}
 	EmitReturn(ctx);
 }
 

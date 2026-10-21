@@ -37,32 +37,74 @@ public:
 		bool queued = false;
 	};
 
+	// Locations indexed through the instruction's borrowed evaluation-index slot instead of a hash
+	// map (perf, uncommitted): a fold did several hash lookups and NHL 27 translates ~7M
+	// instructions per boot. An entry is valid only if the slot points back at the instruction;
+	// every borrowed slot gets its original value back when the table is destroyed.
+	class LocationTable {
+	public:
+		LocationTable() = default;
+		LocationTable(const LocationTable&)            = delete;
+		LocationTable& operator=(const LocationTable&) = delete;
+		~LocationTable() {
+			for (const auto& entry: entries) entry.inst->SetRawEvaluationIndex(entry.saved);
+		}
+		Location* Find(const Inst* inst) {
+			const auto index = inst->RawEvaluationIndex();
+			return index < entries.size() && entries[index].inst == inst ? &entries[index].location
+			                                                               : nullptr;
+		}
+		Location& At(const Inst* inst) {
+			auto* location = Find(inst);
+			EXIT_IF(location == nullptr);
+			return *location;
+		}
+		// Like map::emplace: an instruction that is already registered keeps its location.
+		void Emplace(Inst* inst, Location location) {
+			if (Find(inst) != nullptr) return;
+			entries.push_back({inst, inst->RawEvaluationIndex(), location});
+			inst->SetRawEvaluationIndex(static_cast<uint32_t>(entries.size() - 1));
+		}
+		[[nodiscard]] size_t Size() const { return entries.size(); }
+
+	private:
+		struct Entry {
+			const Inst* inst;
+			uint32_t    saved;
+			Location    location;
+		};
+		std::vector<Entry> entries;
+	};
+
 	void Register(Block::iterator instruction) {
-		locations.emplace(&*instruction, Location {instruction});
+		locations.Emplace(&*instruction, Location {instruction});
 		Queue(&*instruction);
 	}
 
 	void Queue(Inst* inst) {
-		const auto found = locations.find(inst);
-		if (found != locations.end() && !found->second.queued) {
-			found->second.queued = true;
+		auto* found = locations.Find(inst);
+		if (found != nullptr && !found->queued) {
+			found->queued = true;
 			pending.push_back(inst);
 		}
 	}
 
-	void QueueUsers(const std::vector<Use>& users) {
+	void QueueUsers(const UseList& users) {
 		for (const auto& use: users) affected.push_back(use.user);
 	}
 
 	void FlushUsers() {
 		++generation;
+		g_cp_stats.flushes++;
+		g_cp_stats.affected_seeds += affected.size();
 		// Pattern folds inspect nested operands even when intermediate operations
 		// stay dynamic. Visit their union once per drain, including cyclic Phi edges.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
-			const auto found = locations.find(inst);
-			if (found == locations.end() || found->second.visited == generation) continue;
-			found->second.visited = generation;
+			auto* found = locations.Find(inst);
+			if (found == nullptr || found->visited == generation) continue;
+			found->visited = generation;
+			g_cp_stats.affected_visited++;
 			Queue(inst);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
@@ -76,7 +118,7 @@ public:
 		return result;
 	}
 
-	std::unordered_map<Inst*, Location> locations;
+	LocationTable locations;
 	std::vector<Inst*> pending;
 	std::unordered_set<Inst*> lowered_ancillary;
 
@@ -925,7 +967,7 @@ private:
 		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
 		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
 		auto* block = source->Parent();
-		const auto where = m_worklist.locations.at(source).instruction;
+		const auto where = m_worklist.locations.At(source).instruction;
 		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32 ? ValueOpcode::LogicalAnd
 		              : source->GetOpcode() == ValueOpcode::BitwiseOr32 ? ValueOpcode::LogicalOr
 		              : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
@@ -957,35 +999,43 @@ private:
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
+	g_cp_stats.passes++;
 	FoldWorklist worklist;
 	LaneMaskProjection mask_projection(worklist);
 	for (auto* block: blocks)
 		for (auto inst = block->begin(); inst != block->end(); ++inst) worklist.Register(inst);
-	std::vector<Use> users;
+	g_cp_stats.instructions += worklist.locations.Size();
 	std::vector<Value> operands;
 	const auto drain = [&] {
 		do {
 			for (size_t i = 0; i < worklist.pending.size(); ++i) {
 				auto* inst = worklist.pending[i];
-				auto& location = worklist.locations.at(inst);
+				auto& location = worklist.locations.At(inst);
 				location.queued = false;
 				const auto opcode = inst->GetOpcode();
 				if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
 				const auto where = location.instruction;
-				users.assign(inst->Uses().begin(), inst->Uses().end());
+				g_cp_stats.folds++;
+				// The pre-fold users are copied only if the fold changes the use list (perf,
+				// uncommitted; 97% of folds change nothing).
+				g_use_list_watch.inst  = inst;
+				g_use_list_watch.saved = false;
 				operands.clear();
 				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
 				mask_projection.Fold(*inst, wave_size);
 				FoldInstruction(*inst->Parent(), where, worklist);
+				g_use_list_watch.inst = nullptr;
 				bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
 				for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
 					changed = operands[arg] != inst->Arg(arg);
 				if (changed) {
-					worklist.QueueUsers(users);
+					g_cp_stats.changed++;
+					worklist.QueueUsers(g_use_list_watch.saved ? g_use_list_watch.uses : inst->Uses());
 					worklist.Queue(inst);
 				}
 			}
 			worklist.pending.clear();
+			g_cp_stats.rounds++;
 			worklist.FlushUsers();
 		} while (!worklist.pending.empty());
 	};

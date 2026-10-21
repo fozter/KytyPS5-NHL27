@@ -2,6 +2,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 
+#include <algorithm>
+#include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <xbyak/xbyak.h>
 #include <map>
@@ -18,6 +22,77 @@ namespace {
 	EXIT("shader IR validation failed: %s", std::string(message).c_str());
 	std::abort();
 }
+
+// Open-addressing pointer -> index table for ValidateProgram (perf, uncommitted).
+template <typename T>
+class PointerIndex {
+public:
+	explicit PointerIndex(size_t expected) {
+		size_t capacity = 16;
+		while (capacity < expected * 2) {
+			capacity <<= 1;
+		}
+		slots.assign(capacity, {nullptr, 0});
+		mask  = capacity - 1;
+		shift = 64 - std::countr_zero(capacity);
+	}
+	// False if the key is already present.
+	bool Insert(const T* key, size_t value) {
+		if ((count + 1) * 2 > slots.size()) {
+			Grow();
+		}
+		for (size_t index = Hash(key);; index = (index + 1) & mask) {
+			if (slots[index].first == key) {
+				return false;
+			}
+			if (slots[index].first == nullptr) {
+				slots[index] = {key, value};
+				count++;
+				return true;
+			}
+		}
+	}
+	[[nodiscard]] const size_t* Find(const T* key) const {
+		if (key == nullptr) {
+			return nullptr;
+		}
+		for (size_t index = Hash(key);; index = (index + 1) & mask) {
+			if (slots[index].first == key) {
+				return &slots[index].second;
+			}
+			if (slots[index].first == nullptr) {
+				return nullptr;
+			}
+		}
+	}
+	[[nodiscard]] bool   contains(const T* key) const { return Find(key) != nullptr; }
+	[[nodiscard]] size_t at(const T* key) const {
+		const auto* found = Find(key);
+		EXIT_IF(found == nullptr);
+		return *found;
+	}
+
+private:
+	[[nodiscard]] size_t Hash(const T* key) const {
+		return static_cast<size_t>((reinterpret_cast<uintptr_t>(key) * 0x9E3779B97F4A7C15ull) >> shift);
+	}
+	void Grow() {
+		const auto old = std::move(slots);
+		slots.assign(old.size() * 2, {nullptr, 0});
+		mask  = slots.size() - 1;
+		shift = 64 - std::countr_zero(slots.size());
+		count = 0;
+		for (const auto& [key, value]: old) {
+			if (key != nullptr) {
+				Insert(key, value);
+			}
+		}
+	}
+	std::vector<std::pair<const T*, size_t>> slots;
+	size_t                                   mask  = 0;
+	int                                      shift = 64;
+	size_t                                   count = 0;
+};
 
 bool IsRegisterStatePseudo(ValueOpcode opcode) {
 	switch (opcode) {
@@ -243,20 +318,58 @@ bool HasShaderMemoryWrites(const Program& program) {
 	return false;
 }
 
+namespace {
+void ValidateProgramChecks(const Program& program, bool require_ssa);
+} // namespace
+
 void ValidateProgram(const Program& program, bool require_ssa) {
+	// Diagnostic switch (uncommitted): KYTY_IR_VALIDATE=0 skips validation, which only ever EXITs
+	// on malformed IR. Its time is summed in g_diag_validate_ms ([shphase] cum_val).
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IR_VALIDATE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) {
+		return;
+	}
+	const auto begin = std::chrono::steady_clock::now();
+	ValidateProgramChecks(program, require_ssa);
+	g_diag_validate_ms +=
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+}
+
+namespace {
+void ValidateProgramChecks(const Program& program, bool require_ssa) {
 	if (program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");
 	}
-	std::unordered_map<const Block*, size_t>   block_indices;
-	std::unordered_set<uint32_t>               block_ids;
-	std::unordered_map<const Inst*, size_t>    instruction_positions;
+	// Flat indices, small vectors, precomputed reverse-use flags and a dominator tree instead of
+	// node maps, per-block sets, per-argument use searches and a block x block bit matrix (perf,
+	// uncommitted): validation runs twice per shader and was ~20% of NHL 27's translation. Same
+	// checks in the same order.
+	size_t instruction_count = 0;
+	for (const auto& storage: program.block_storage) {
+		instruction_count += storage != nullptr ? storage->Instructions().size() : 0;
+	}
+	PointerIndex<Block>          block_indices(program.blocks.size());
+	std::unordered_set<uint32_t> block_ids;
+	PointerIndex<Inst>           instruction_ordinals(instruction_count);
+	std::vector<const Inst*>     instructions;
+	std::vector<size_t>          positions;
+	std::vector<size_t>          arg_offsets;
+	std::vector<size_t>          block_of;
+	instructions.reserve(instruction_count);
+	block_of.reserve(instruction_count);
+	positions.reserve(instruction_count);
+	arg_offsets.reserve(instruction_count);
+	size_t total_args = 0;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		const auto* block = program.blocks[block_index];
 		if (block == nullptr || program.block_storage[block_index] == nullptr ||
 		    block != program.block_storage[block_index].get()) {
 			return Fail("value IR block pointer is inconsistent");
 		}
-		if (!block_indices.emplace(block, block_index).second) {
+		if (!block_indices.Insert(block, block_index)) {
 			return Fail("value IR block pointer is duplicated");
 		}
 		if (block->id == UINT32_MAX) {
@@ -267,8 +380,26 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		}
 		size_t position = 0;
 		for (const auto& inst: *block) {
-			if (!instruction_positions.emplace(&inst, position++).second) {
+			if (!instruction_ordinals.Insert(&inst, instructions.size())) {
 				return Fail("value IR instruction is duplicated");
+			}
+			instructions.push_back(&inst);
+			block_of.push_back(block_index);
+			positions.push_back(position++);
+			arg_offsets.push_back(total_args);
+			total_args += inst.NumArgs();
+		}
+	}
+	// has_reverse_use[arg_offsets[user] + operand]: the argument's definition lists that use.
+	std::vector<uint8_t> has_reverse_use(total_args, 0);
+	// arg_definitions[arg_offsets[user] + operand]: ordinal of the argument's definition.
+	std::vector<size_t> arg_definitions(total_args, SIZE_MAX);
+	for (const auto* definition: instructions) {
+		for (const auto& use: definition->Uses()) {
+			const auto* ordinal = instruction_ordinals.Find(use.user);
+			if (ordinal != nullptr && use.operand < use.user->NumArgs() &&
+			    use.user->Arg(use.operand).TryInstruction() == definition) {
+				has_reverse_use[arg_offsets[*ordinal] + use.operand] = 1;
 			}
 		}
 	}
@@ -276,42 +407,54 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		return Fail("value IR entry block has a predecessor");
 	}
 
+	const auto contains = [](const std::vector<const Block*>& list, const Block* block) {
+		return std::ranges::find(list, block) != list.end();
+	};
+	std::vector<const Block*> predecessors;
+	std::vector<const Block*> successors;
+	std::vector<const Block*> expected_successors;
+	std::vector<const Block*> incoming_blocks;
+	size_t                    ordinal = 0;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
-		const auto*                      block = program.blocks[block_index];
-		std::unordered_set<const Block*> predecessors;
+		const auto* block = program.blocks[block_index];
+		predecessors.clear();
 		for (const auto* predecessor: block->ImmPredecessors()) {
 			if (predecessor == nullptr || !block_indices.contains(predecessor)) {
 				return Fail("value IR block has a foreign predecessor");
 			}
-			if (!predecessors.insert(predecessor).second) {
+			if (contains(predecessors, predecessor)) {
 				return Fail("value IR block predecessor is duplicated");
 			}
+			predecessors.push_back(predecessor);
 			if (std::ranges::find(predecessor->ImmSuccessors(), block) ==
 			    predecessor->ImmSuccessors().end()) {
 				return Fail("value IR predecessor edge is not reciprocal");
 			}
 		}
 
-		std::unordered_set<const Block*> successors;
+		successors.clear();
 		for (const auto* successor: block->ImmSuccessors()) {
 			if (successor == nullptr || !block_indices.contains(successor)) {
 				return Fail("value IR block has a foreign successor");
 			}
-			if (!successors.insert(successor).second) {
+			if (contains(successors, successor)) {
 				return Fail("value IR block successor is duplicated");
 			}
+			successors.push_back(successor);
 			if (std::ranges::find(successor->ImmPredecessors(), block) ==
 			    successor->ImmPredecessors().end()) {
 				return Fail("value IR successor edge is not reciprocal");
 			}
 		}
 
-		std::unordered_set<const Block*> expected_successors;
-		const auto                       add_target = [&](const Block* target) {
-			if (!block_indices.contains(target)) {
+		expected_successors.clear();
+		const auto add_target = [&](const Block* target) {
+			if (target == nullptr || !block_indices.contains(target)) {
 				return false;
 			}
-			expected_successors.insert(target);
+			if (!contains(expected_successors, target)) {
+				expected_successors.push_back(target);
+			}
 			return true;
 		};
 		const auto& terminator             = block->terminator;
@@ -320,7 +463,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				return false;
 			}
 			const auto* definition = value.TryInstruction();
-			return definition == nullptr || instruction_positions.contains(definition);
+			return definition == nullptr || instruction_ordinals.contains(definition);
 		};
 		switch (terminator.kind) {
 			case CFG::TerminatorKind::Branch:
@@ -360,12 +503,16 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		     !block_indices.contains(terminator.continue_block))) {
 			return Fail("value IR structured control target is missing");
 		}
-		if (successors != expected_successors) {
+		if (successors.size() != expected_successors.size() ||
+		    !std::ranges::all_of(successors, [&](const Block* successor) {
+			    return contains(expected_successors, successor);
+		    })) {
 			return Fail("value IR terminator and successor graph disagree");
 		}
 
 		bool saw_non_phi = false;
 		for (const auto& inst: *block) {
+			const auto inst_ordinal = ordinal++;
 			if (inst.Parent() != block) {
 				return Fail("value IR instruction has the wrong parent block");
 			}
@@ -379,21 +526,22 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				if (inst.NumArgs() == 0) {
 					return Fail("value IR Phi has no incoming values");
 				}
-				std::unordered_set<const Block*> incoming_blocks;
+				incoming_blocks.clear();
 				for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
 					const auto* predecessor = inst.PhiBlock(arg_index);
 					if (predecessor == nullptr || !block_indices.contains(predecessor) ||
-					    !predecessors.contains(predecessor)) {
+					    !contains(predecessors, predecessor)) {
 						return Fail("value IR Phi has a foreign or non-predecessor parent");
 					}
-					if (!incoming_blocks.insert(predecessor).second) {
+					if (contains(incoming_blocks, predecessor)) {
 						return Fail("value IR Phi parent is duplicated");
 					}
+					incoming_blocks.push_back(predecessor);
 					if (inst.Arg(arg_index).GetType() != inst.GetType()) {
 						return Fail("value IR Phi incoming type does not match its result");
 					}
 				}
-				if (incoming_blocks != predecessors) {
+				if (incoming_blocks.size() != predecessors.size()) {
 					return Fail("value IR Phi does not cover every predecessor");
 				}
 			} else {
@@ -574,16 +722,15 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        TypeName(arg.GetType()),
 					                        TypeName(ArgTypeOf(inst.GetOpcode(), arg_index))));
 				}
-				if (const auto* definition = arg.TryInstruction();
-				    definition != nullptr && !instruction_positions.contains(definition)) {
+				const auto* definition = arg.TryInstruction();
+				const auto* definition_ordinal =
+				    definition != nullptr ? instruction_ordinals.Find(definition) : nullptr;
+				if (definition != nullptr && definition_ordinal == nullptr) {
 					return Fail("value IR argument has a foreign definition");
 				}
-				if (const auto* definition = arg.TryInstruction(); definition != nullptr) {
-					const auto& uses = definition->Uses();
-					const auto  use  = std::ranges::find_if(uses, [&](const Use& candidate) {
-						return candidate.user == &inst && candidate.operand == arg_index;
-					});
-					if (use == uses.end()) {
+				if (definition != nullptr) {
+					arg_definitions[arg_offsets[inst_ordinal] + arg_index] = *definition_ordinal;
+					if (has_reverse_use[arg_offsets[inst_ordinal] + arg_index] == 0) {
 						return Fail(fmt::format("{} argument {} is absent from {} reverse uses",
 						                        ValueOpcodeName(inst.GetOpcode()), arg_index,
 						                        ValueOpcodeName(definition->GetOpcode())));
@@ -614,31 +761,106 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		return Fail("value IR contains an unreachable block");
 	}
 
-	std::vector<std::vector<bool>> dominators(program.blocks.size(),
-	                                          std::vector<bool>(program.blocks.size(), true));
-	dominators.front().assign(program.blocks.size(), false);
-	dominators.front().front() = true;
-	bool changed               = true;
-	while (changed) {
-		changed = false;
-		for (size_t block_index = 1; block_index < program.blocks.size(); block_index++) {
-			std::vector<bool> next(program.blocks.size(), true);
-			for (const auto* predecessor: program.blocks[block_index]->ImmPredecessors()) {
-				const auto predecessor_index = block_indices.at(predecessor);
-				for (size_t candidate = 0; candidate < next.size(); candidate++) {
-					next[candidate] = next[candidate] && dominators[predecessor_index][candidate];
+	// Immediate dominators (Cooper, Harvey, Kennedy) over a reverse postorder, then dominator-tree
+	// DFS intervals. Every block is reachable here, so this is the same (reflexive) relation as
+	// the former per-block bit-set fixpoint.
+	const auto          block_count = program.blocks.size();
+	std::vector<size_t> postorder;
+	std::vector<size_t> postorder_number(block_count, 0);
+	{
+		postorder.reserve(block_count);
+		std::vector<bool>                      visited(block_count, false);
+		std::vector<std::pair<size_t, size_t>> stack {{0u, 0u}};
+		visited.front() = true;
+		while (!stack.empty()) {
+			const auto index      = stack.back().first;
+			const auto successors = program.blocks[index]->ImmSuccessors();
+			if (stack.back().second < successors.size()) {
+				const auto successor = block_indices.at(successors[stack.back().second++]);
+				if (!visited[successor]) {
+					visited[successor] = true;
+					stack.emplace_back(successor, 0u);
 				}
+				continue;
 			}
-			next[block_index] = true;
-			if (next != dominators[block_index]) {
-				dominators[block_index] = std::move(next);
-				changed                 = true;
+			postorder_number[index] = postorder.size();
+			postorder.push_back(index);
+			stack.pop_back();
+		}
+	}
+	constexpr size_t    Undefined = SIZE_MAX;
+	std::vector<size_t> immediate_dominator(block_count, Undefined);
+	immediate_dominator.front() = 0;
+	const auto intersect        = [&](size_t left, size_t right) {
+		while (left != right) {
+			while (postorder_number[left] < postorder_number[right]) {
+				left = immediate_dominator[left];
+			}
+			while (postorder_number[right] < postorder_number[left]) {
+				right = immediate_dominator[right];
+			}
+		}
+		return left;
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto it = postorder.rbegin(); it != postorder.rend(); ++it) {
+			const auto index = *it;
+			if (index == 0) {
+				continue;
+			}
+			size_t next = Undefined;
+			for (const auto* predecessor: program.blocks[index]->ImmPredecessors()) {
+				const auto predecessor_index = block_indices.at(predecessor);
+				if (immediate_dominator[predecessor_index] == Undefined) {
+					continue;
+				}
+				next = next == Undefined ? predecessor_index : intersect(predecessor_index, next);
+			}
+			if (next != immediate_dominator[index]) {
+				immediate_dominator[index] = next;
+				changed                    = true;
 			}
 		}
 	}
+	std::vector<size_t> child_start(block_count + 1, 0);
+	for (size_t index = 1; index < block_count; index++) {
+		child_start[immediate_dominator[index] + 1]++;
+	}
+	for (size_t index = 0; index < block_count; index++) {
+		child_start[index + 1] += child_start[index];
+	}
+	std::vector<size_t> children(block_count > 0 ? block_count - 1 : 0);
+	{
+		auto cursor = child_start;
+		for (size_t index = 1; index < block_count; index++) {
+			children[cursor[immediate_dominator[index]]++] = index;
+		}
+	}
+	std::vector<size_t> enter(block_count, 0);
+	std::vector<size_t> leave(block_count, 0);
+	{
+		size_t                                 clock = 0;
+		std::vector<std::pair<size_t, size_t>> stack {{0u, child_start[0]}};
+		enter.front() = clock++;
+		while (!stack.empty()) {
+			const auto index = stack.back().first;
+			if (stack.back().second < child_start[index + 1]) {
+				const auto child = children[stack.back().second++];
+				enter[child]     = clock++;
+				stack.emplace_back(child, child_start[child]);
+				continue;
+			}
+			leave[index] = clock++;
+			stack.pop_back();
+		}
+	}
 
+	const auto dominates_index = [&](size_t definition_index, size_t use_index) {
+		return enter[definition_index] <= enter[use_index] && leave[use_index] <= leave[definition_index];
+	};
 	const auto dominates = [&](const Block* definition, const Block* use) {
-		return dominators[block_indices.at(use)][block_indices.at(definition)];
+		return dominates_index(block_indices.at(definition), block_indices.at(use));
 	};
 	const auto control_dominates = [&](Value value, const Block* use) {
 		const auto* definition = value.TryInstruction();
@@ -646,25 +868,29 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		       dominates(definition->Parent(), use);
 	};
 
+	// Every definition is in the program and in its parent block (checked above), so the
+	// recorded ordinals give its block and position without further lookups.
+	ordinal = 0;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		const auto* block = program.blocks[block_index];
 		for (const auto& inst: *block) {
+			const auto inst_ordinal = ordinal++;
 			for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
-				const auto* definition = inst.Arg(arg_index).TryInstruction();
-				if (definition == nullptr) {
+				const auto definition = arg_definitions[arg_offsets[inst_ordinal] + arg_index];
+				if (definition == SIZE_MAX) {
 					continue;
 				}
+				const auto definition_block = block_of[definition];
 				if (inst.GetOpcode() == ValueOpcode::Phi) {
-					const auto* predecessor = inst.PhiBlock(arg_index);
-					if (definition->Parent() != predecessor &&
-					    !dominates(definition->Parent(), predecessor)) {
+					const auto predecessor = block_indices.at(inst.PhiBlock(arg_index));
+					if (definition_block != predecessor && !dominates_index(definition_block, predecessor)) {
 						return Fail("value IR Phi incoming definition does not dominate its edge");
 					}
-				} else if (definition->Parent() == block) {
-					if (instruction_positions.at(definition) >= instruction_positions.at(&inst)) {
+				} else if (definition_block == block_index) {
+					if (positions[definition] >= positions[inst_ordinal]) {
 						return Fail("value IR instruction uses a same-block definition before it");
 					}
-				} else if (!dominates(definition->Parent(), block)) {
+				} else if (!dominates_index(definition_block, block_index)) {
 					return Fail("value IR instruction definition does not dominate its use");
 				}
 			}
@@ -678,6 +904,8 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		}
 	}
 }
+
+} // namespace
 
 std::string ProgramToString(const Program& program) {
 	std::map<const Inst*, size_t> ids;

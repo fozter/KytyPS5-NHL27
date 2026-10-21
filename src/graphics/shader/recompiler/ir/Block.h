@@ -16,7 +16,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // dependency.
 class Block {
 public:
-	using InstructionList = std::list<Inst>;
+	using InstructionList = std::list<Inst, PoolAllocator<Inst>>;
 	using iterator        = InstructionList::iterator;
 	using const_iterator  = InstructionList::const_iterator;
 
@@ -75,6 +75,9 @@ public:
 	std::array<Value, NumScalarRegs> ssa_thread_bit_sreg_values {};
 	std::array<Value, NumScalarRegs> ssa_sreg_mask_tags {};
 	std::array<Value, NumVectorRegs> ssa_vreg_values {};
+	// SCC, EXEC, EXEC_LO, EXEC_HI, VCC, VCC_LO, VCC_HI, M0 (were hash maps in SsaRewrite: perf,
+	// uncommitted).
+	std::array<Value, 8> ssa_flag_values {};
 
 private:
 	InstructionList     instructions;

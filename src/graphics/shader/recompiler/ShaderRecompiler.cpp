@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
@@ -27,6 +28,13 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
+
+// Diagnostic (uncommitted): cumulative sub-pass timing accumulators.
+static double   g_diag_cp_ms      = 0.0;
+static double   g_diag_id_ms      = 0.0;
+static double   g_diag_dce_ms     = 0.0;
+static uint64_t g_diag_norm_iters = 0;
+
 
 namespace {
 
@@ -829,24 +837,41 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	const auto diag_ir = std::chrono::steady_clock::now();
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
-	const auto simplify = [&ir] {
-		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	const auto diag_ssa = std::chrono::steady_clock::now();
+	uint64_t diag_norm_iters = 0;
+	{
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size); // 0009 counter gone (upstream f6f1ac8b)
+		const auto diag_cp = std::chrono::steady_clock::now();
 		IR::RemoveIdentities(ir);
+		const auto diag_id = std::chrono::steady_clock::now();
 		IR::EliminateDeadCode(ir.blocks);
-	};
-	simplify();
+		g_diag_cp_ms += std::chrono::duration<double, std::milli>(diag_cp - diag_ssa).count();
+		g_diag_id_ms += std::chrono::duration<double, std::milli>(diag_id - diag_cp).count();
+		g_diag_dce_ms +=
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - diag_id)
+		        .count();
+		g_diag_norm_iters += diag_norm_iters;
+	}
+	const auto diag_simp1 = std::chrono::steady_clock::now();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	const auto diag_readlane   = std::chrono::steady_clock::now();
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "\n",
 		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
-	simplify();
+	{
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::RemoveIdentities(ir);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	const auto diag_simplify = std::chrono::steady_clock::now();
 	if (decoded.has_swap_pc) {
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
 		for (const auto* block: ir.blocks)
@@ -863,6 +888,28 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	const auto diag_track = std::chrono::steady_clock::now();
+	// Diagnostic (uncommitted): fine-grained sub-phase timing to stderr. The
+	// integer-ms "phase end" logs above round sub-ms phases to zero; this
+	// uses fractional ms and covers the previously unlogged middle where the
+	// boot census showed ~97% of translation time hides.
+	std::fprintf(stderr,
+	             "[shphase] %016" PRIx64 " ir=%.2fms ssa=%.2fms simp1=%.2fms readlane=%.2fms "
+	             "simp2=%.2fms track=%.2fms | cum_cp=%.0fms cum_id=%.0fms cum_dce=%.0fms cum_val=%.0fms "
+	             "cum_norm_iters=%" PRIu64 " | cp passes=%" PRIu64 " insts=%" PRIu64 " folds=%" PRIu64
+	             " changed=%" PRIu64 " rounds=%" PRIu64 " seeds=%" PRIu64 " visited=%" PRIu64 "\n",
+	             options.shader_hash,
+	             std::chrono::duration<double, std::milli>(diag_ir - compile_begin).count(),
+	             std::chrono::duration<double, std::milli>(diag_ssa - diag_ir).count(),
+	             std::chrono::duration<double, std::milli>(diag_simp1 - diag_ssa).count(),
+	             std::chrono::duration<double, std::milli>(diag_readlane - diag_simp1).count(),
+	             std::chrono::duration<double, std::milli>(diag_simplify - diag_readlane).count(),
+	             std::chrono::duration<double, std::milli>(diag_track - diag_simplify).count(),
+	             g_diag_cp_ms, g_diag_id_ms, g_diag_dce_ms, IR::g_diag_validate_ms, g_diag_norm_iters,
+	             IR::g_cp_stats.passes, IR::g_cp_stats.instructions, IR::g_cp_stats.folds,
+	             IR::g_cp_stats.changed, IR::g_cp_stats.rounds, IR::g_cp_stats.affected_seeds,
+	             IR::g_cp_stats.affected_visited);
+	std::fflush(stderr);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

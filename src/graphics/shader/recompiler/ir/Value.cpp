@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/Value.h"
+#include "graphics/shader/recompiler/ir/Block.h"
 
 #include <algorithm>
 #include <cstring>
@@ -6,7 +7,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-Value::Value(Inst* value): type(Type::Opaque), inst(value) {}
 Value::Value(ScalarReg value): type(Type::ScalarReg), scalar_reg(value) {}
 Value::Value(VectorReg value): type(Type::VectorReg), vector_reg(value) {}
 Value::Value(bool value): type(Type::U1), imm_u1(value) {}
@@ -25,22 +25,6 @@ Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
 }
 
-bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
-bool Value::IsPhi() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
-}
-
 Type Value::GetType() const {
 	if (IsPhi()) {
 		return inst->Flags<Type>();
@@ -56,19 +40,6 @@ Inst* Value::Instruction() const {
 	return inst;
 }
 
-Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
-Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
-}
-
 ScalarReg Value::ScalarRegister() const {
 	EXIT_IF(type != Type::ScalarReg);
 	return scalar_reg;
@@ -77,61 +48,6 @@ ScalarReg Value::ScalarRegister() const {
 VectorReg Value::VectorRegister() const {
 	EXIT_IF(type != Type::VectorReg);
 	return vector_reg;
-}
-
-bool Value::U1() const {
-	EXIT_IF(type != Type::U1);
-	return imm_u1;
-}
-
-uint8_t Value::U8() const {
-	EXIT_IF(type != Type::U8);
-	return imm_u8;
-}
-
-uint16_t Value::U16() const {
-	EXIT_IF(type != Type::U16);
-	return imm_u16;
-}
-
-uint32_t Value::U32() const {
-	EXIT_IF(type != Type::U32);
-	return imm_u32;
-}
-
-uint64_t Value::U64() const {
-	EXIT_IF(type != Type::U64);
-	return imm_u64;
-}
-
-uint16_t Value::F16Bits() const {
-	EXIT_IF(type != Type::F16);
-	return imm_u16;
-}
-
-float Value::F32Value() const {
-	EXIT_IF(type != Type::F32);
-	return std::bit_cast<float>(imm_u32);
-}
-
-bool Value::operator==(const Value& other) const {
-	if (type != other.type) {
-		return false;
-	}
-	switch (type) {
-		case Type::Void: return true;
-		case Type::Opaque: return inst == other.inst;
-		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
-		case Type::VectorReg: return vector_reg == other.vector_reg;
-		case Type::U1: return imm_u1 == other.imm_u1;
-		case Type::U8: return imm_u8 == other.imm_u8;
-		case Type::U16:
-		case Type::F16: return imm_u16 == other.imm_u16;
-		case Type::U32:
-		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
-		default: return false;
-	}
 }
 
 Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
@@ -152,10 +68,6 @@ Inst::~Inst() {
 	ClearArgs();
 }
 
-ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
-
 Type Inst::GetType() const {
 	if (opcode == ValueOpcode::Phi) {
 		return static_cast<Type>(flags);
@@ -170,41 +82,13 @@ bool Inst::MayHaveSideEffects() const {
 	return HasSideEffects(opcode);
 }
 
-bool Inst::HasUses() const {
-	return !uses.empty();
-}
-
-size_t Inst::UseCount() const {
-	return uses.size();
-}
-
-size_t Inst::NumArgs() const {
-	return num_args == PhiArity ? phi_args.size() : num_args;
-}
-
 size_t Inst::NumPhiBlocks() const {
 	return num_args == PhiArity ? phi_args.size() : 0;
-}
-
-Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
 }
 
 Block* Inst::PhiBlock(size_t index) const {
 	EXIT_IF(opcode != ValueOpcode::Phi || index >= phi_args.size());
 	return phi_args[index].first;
-}
-
-Block* Inst::Parent() const {
-	return parent;
-}
-
-const std::vector<Use>& Inst::Uses() const {
-	return uses;
 }
 
 void Inst::SetParent(Block* block) {
@@ -230,6 +114,10 @@ void Inst::SetArg(size_t index, Value value) {
 
 void Inst::AddPhiOperand(Block* predecessor, Value value) {
 	EXIT_IF(opcode != ValueOpcode::Phi);
+	// One allocation per Phi instead of growing one operand at a time (perf, uncommitted).
+	if (phi_args.empty() && parent != nullptr) {
+		phi_args.reserve(parent->ImmPredecessors().size());
+	}
 	const auto index = phi_args.size();
 	phi_args.emplace_back(predecessor, value);
 	if (auto* value_inst = value.TryInstruction(); value_inst != nullptr) {
@@ -238,9 +126,32 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
-	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+	NoteUseListChange(this);
+	auto* const replacement_inst = replacement.TryInstruction();
+	if (replacement_inst != this) {
+		// Detach the whole use list instead of erasing each use from its front (perf, uncommitted):
+		// that was quadratic for values with thousands of uses. Same resulting use order.
+		const auto old_uses = std::move(uses);
+		uses.clear();
+		for (const auto& use: old_uses) {
+			auto* const user = use.user;
+			EXIT_IF(user->Arg(use.operand).TryInstruction() != this);
+			if (user->num_args <= InlineArity) {
+				user->fixed_args[use.operand] = replacement;
+			} else if (user->num_args == PhiArity) {
+				user->phi_args[use.operand].second = replacement;
+			} else {
+				user->large_args[use.operand] = replacement;
+			}
+			if (replacement_inst != nullptr) {
+				user->AddUse(replacement_inst, use.operand);
+			}
+		}
+	} else {
+		const auto old_uses = uses;
+		for (const auto& use: old_uses) {
+			use.user->SetArg(use.operand, replacement);
+		}
 	}
 	Invalidate();
 	if (preserve) {
@@ -255,10 +166,23 @@ void Inst::Invalidate() {
 	opcode = ValueOpcode::Void;
 }
 
+thread_local UseListWatch g_use_list_watch;
+
+void Inst::NoteUseListChange(const Inst* inst) {
+	auto& watch = g_use_list_watch;
+	if (watch.inst == inst && !watch.saved) {
+		watch.uses  = inst->uses;
+		watch.saved = true;
+	}
+}
+
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
+	NoteUseListChange(used);
+	// Most values gain a few uses one at a time: start at four instead of growing 1, 2, 3, 4
+	// (perf, uncommitted).
+	if (used->uses.capacity() == 0) {
+		used->uses.reserve(4);
+	}
 	used->uses.push_back({this, operand});
 }
 
@@ -266,6 +190,7 @@ void Inst::RemoveUse(Inst* used, size_t operand) {
 	const auto found = std::ranges::find_if(
 	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
 	EXIT_IF(found == used->uses.end());
+	NoteUseListChange(used);
 	used->uses.erase(found);
 }
 
