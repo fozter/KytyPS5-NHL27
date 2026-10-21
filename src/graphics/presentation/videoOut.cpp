@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -1867,6 +1869,26 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	// Experiment (uncommitted): KYTY_VIDEO_OUT_RES overrides the reported resolution (1 = 1080p).
+	// NHL 27 first opens the main port only to probe it and picks its render profile from that
+	// answer; its packaged profiles have PS5_4K but no PS5_BASE, so a non-4K answer there crashes
+	// the game (instructions 8.11). The first main-port open keeps the native answer, as in
+	// pengui07/KytyPS5-nhl c23cc926; KYTY_VIDEO_OUT_RES_PROBE=1 overrides that probe too.
+	if (const char* const res_override = std::getenv("KYTY_VIDEO_OUT_RES");
+	    res_override != nullptr) {
+		static const bool override_probe = std::getenv("KYTY_VIDEO_OUT_RES_PROBE") != nullptr;
+		const bool        probe = ctx->bus == VIDEO_OUT_BUS_TYPE_MAIN && ctx->generation == 1;
+		if (!probe || override_probe) {
+			status->resolution = static_cast<uint32_t>(strtoul(res_override, nullptr, 0));
+		}
+		static std::atomic<int> res_logged {0};
+		if (res_logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("[videooutres] bus %d generation %llu: reporting resolution %u%s\n", ctx->bus,
+			            static_cast<unsigned long long>(ctx->generation), status->resolution,
+			            probe && !override_probe ? " (native: first main-port open)" : "");
+			std::fflush(stdout);
+		}
+	}
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

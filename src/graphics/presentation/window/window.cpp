@@ -29,6 +29,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -829,7 +830,41 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	// Local (uncommitted): KYTY_WINDOW_DISPLAY=<n> centers the window on the n-th display SDL lists,
+	// KYTY_WINDOW_DISPLAY=secondary on the first one that is not the primary display.
+	SDL_DisplayID window_display = 0;
+	if (const char* wanted = std::getenv("KYTY_WINDOW_DISPLAY"); wanted != nullptr) {
+		int   count    = 0;
+		auto* displays = SDL_GetDisplays(&count);
+		if (displays != nullptr) {
+			const auto primary = SDL_GetPrimaryDisplay();
+			for (int i = 0; i < count; i++) {
+				const bool match = std::string_view(wanted) == "secondary"
+				                       ? displays[i] != primary
+				                       : std::atoi(wanted) == i;
+				if (match) {
+					window_display = displays[i];
+					break;
+				}
+			}
+			SDL_free(displays);
+		}
+	}
+	// KYTY_WINDOW_TOPLEFT=1: the top-left corner of that display (or the primary one) instead of
+	// its centre; the position is the client area's, so the title bar is added back.
+	SDL_Rect bounds {};
+	if (std::getenv("KYTY_WINDOW_TOPLEFT") != nullptr &&
+	    SDL_GetDisplayBounds(window_display != 0 ? window_display : SDL_GetPrimaryDisplay(),
+	                         &bounds)) {
+		int top = 0, left = 0, bottom = 0, right = 0;
+		(void)SDL_GetWindowBordersSize(context.window, &top, &left, &bottom, &right);
+		SDL_SetWindowPosition(context.window, bounds.x + left, bounds.y + (top > 0 ? top : 31));
+	} else if (window_display != 0) {
+		SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED_DISPLAY(window_display),
+		                      SDL_WINDOWPOS_CENTERED_DISPLAY(window_display));
+	} else {
+		SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	}
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();

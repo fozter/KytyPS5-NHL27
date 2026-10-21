@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuCrashDiag.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -428,11 +429,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	// Two queues of the graphics family: index 0 renders; index 1 serves the
+	// buffer-readback downloads (uncommitted perf work — see BufferCache::ReadMemory)
+	// when the family exposes more than one queue.
+	const auto families = physical_device.getQueueFamilyProperties();
+	const float queue_priorities[2] = {1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount =
+	    queue_family < families.size() && families[queue_family].queueCount > 1u ? 2u : 1u;
+	queue_create_info.pQueuePriorities = queue_priorities;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -695,6 +701,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	create_info.pEnabledFeatures        = &device_features;
 
 	vk::Device device = nullptr;
+
+	GpuCrashDiag::ChainDeviceCreateInfo(create_info);
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
@@ -1076,6 +1084,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		GpuCrashDiag::SelectDeviceExtensions(available_extensions, device_extensions);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1085,6 +1094,41 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	// Readback queue: a second queue of the same family. Same family means no
+	// queue-ownership barriers for copies between it and the graphics queue;
+	// execution overlap comes from the separate hardware queue.
+	{
+		const auto families = graphic_ctx.physical_device.getQueueFamilyProperties();
+		if (graphic_ctx.queue_family < families.size() &&
+		    families[graphic_ctx.queue_family].queueCount > 1u) {
+			graphic_ctx.readback_queue_family = graphic_ctx.queue_family;
+			graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1u, &graphic_ctx.readback_queue);
+			vk::CommandPoolCreateInfo pool_info {};
+			pool_info.queueFamilyIndex = graphic_ctx.queue_family;
+			if (graphic_ctx.device.createCommandPool(&pool_info, nullptr,
+			                                         &graphic_ctx.readback_pool) ==
+			        vk::Result::eSuccess &&
+			    graphic_ctx.readback_queue != nullptr) {
+				LOGF("ReadbackQueue: created second queue of family %u (%u queues in family)\n",
+				     graphic_ctx.queue_family, families[graphic_ctx.queue_family].queueCount);
+			} else {
+				LOGF("ReadbackQueue: FAILED to create (family %u), falling back to synchronous "
+				     "readbacks\n",
+				     graphic_ctx.queue_family);
+				graphic_ctx.readback_queue       = nullptr;
+				graphic_ctx.readback_queue_family = static_cast<uint32_t>(-1);
+				if (graphic_ctx.readback_pool != nullptr) {
+					graphic_ctx.device.destroyCommandPool(graphic_ctx.readback_pool, nullptr);
+					graphic_ctx.readback_pool = nullptr;
+				}
+			}
+		} else {
+			LOGF("ReadbackQueue: family %u has a single queue, falling back to synchronous "
+			     "readbacks\n",
+			     graphic_ctx.queue_family);
+		}
+	}
+	GpuCrashDiag::Install(&graphic_ctx);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1124,6 +1168,12 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		if (graphic_ctx.readback_pool != nullptr) {
+			graphic_ctx.device.destroyCommandPool(graphic_ctx.readback_pool, nullptr);
+			graphic_ctx.readback_pool = nullptr;
+		}
+		graphic_ctx.readback_queue       = nullptr;
+		graphic_ctx.readback_queue_family = static_cast<uint32_t>(-1);
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

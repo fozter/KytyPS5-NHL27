@@ -198,6 +198,26 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
 
+# Profile-guided optimization (uncommitted; options as in chenxiao07's fork). KYTY_PGO_GENERATE
+# builds an instrumented emulator that writes LLVM_PROFILE_FILE every 30 s (graphicsRun.cpp);
+# merge the .profraw files with llvm-profdata and pass the result as KYTY_PGO_USE.
+option(KYTY_PGO_GENERATE "Instrumented build for PGO training" OFF)
+set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
+if(KYTY_PGO_GENERATE)
+	cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH kyty_llvm_bin)
+	file(GLOB kyty_profile_runtime "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+	if(NOT kyty_profile_runtime)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}")
+	endif()
+	list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+	add_compile_options(-fprofile-instr-generate)
+	add_compile_definitions(KYTY_PGO_GENERATE=1)
+	link_libraries("${kyty_profile_runtime}")
+elseif(KYTY_PGO_USE)
+	add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+	                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+endif()
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
@@ -301,6 +321,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(dispatch_guard_shader_source "${gpu_tiler_shader_dir}/gpu_dispatch_args_guard.comp")
+set(dispatch_guard_shader_spv "${gpu_tiler_generated_dir}/gpu_dispatch_args_guard.spv")
+set(dispatch_guard_shader_header "${gpu_tiler_generated_dir}/gpu_dispatch_args_guard_spv.h")
+add_custom_command(
+	OUTPUT "${dispatch_guard_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dispatch_guard_shader_spv}" "${dispatch_guard_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dispatch_guard_shader_spv} -DOUTPUT=${dispatch_guard_shader_header}
+	        -DSYMBOL=GPU_DISPATCH_ARGS_GUARD_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dispatch_guard_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dispatch_guard_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -335,6 +370,11 @@ list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+	# Diagnostic (uncommitted): line tables for the shader recompiler, so KYTY_DIAG_SAMPLER
+	# profiles resolve to source lines. No code generation change.
+	file(GLOB_RECURSE kyty_recompiler_line_table_src CONFIGURE_DEPENDS "${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
+	     "${KYTY_SOURCE_DIR}/graphics/guest_gpu/*.cpp" "${KYTY_SOURCE_DIR}/graphics/host_gpu/*.cpp")
+	set_source_files_properties(${kyty_recompiler_line_table_src} PROPERTIES COMPILE_OPTIONS "-gline-tables-only")
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader)
@@ -377,6 +417,8 @@ function(add_kyty_full_emulator_test target source)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
+		# Diagnostic (uncommitted): a PDB for the tests, so crashes symbolize (cdb, llvm-symbolizer).
+		target_link_options(${target} PRIVATE "/DEBUG:FULL")
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
 	# The macOS x86_64 guest address space needs its .zerofill segments anchored
