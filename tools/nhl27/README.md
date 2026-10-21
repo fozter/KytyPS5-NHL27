@@ -8,20 +8,6 @@ written with AI assistants (Claude, GLM); the game runs and tests were done by f
 Paths in these scripts point at `D:\PS5_GAMES\NHL27` (the game as `NHL27_PPSA34063.zar`, the
 emulator checkout as `KytyPS5`).
 
-## Scripts
-
-| File | Purpose |
-| --- | --- |
-| `run_nhl_silent_tess.cmd` | Launcher with the branch's defaults (1080p output, tessellation, dense SRT walker, fault emulation, IR validator off, window on the second screen). Any default can be overridden by setting the variable before launching. |
-| `build_kyty.cmd`, `build_target.cmd` | Configure / build with VS 2022 + clang-cl. |
-| `pgo_configure.cmd` | `generate` (instrumented build), `use <profdata>`, `off`: profile-guided optimization. |
-| `frame_trace.py` | Frame pacing from a `KYTY_FRAME_TRACE` capture: per suspend-point interval the game's wait, GPU-thread busy/drain/record time, GPU tail. `--alternate <s>` splits the intervals of a `KYTY_*_ALTERNATE` A/B run and compares adjacent windows. |
-| `symbolize_samples.py` | Profiles from `KYTY_DIAG_SAMPLER` captures; `--threads` and `--timeline` for all-thread captures (mode 3). |
-| `watch_run.ps1` | Logs the window title's frame counter / fps and GPU memory every ~13 s. |
-| `cmp_spvhash.py` | SPIR-V equality and per-shader compile-phase timings between two boots. |
-| `synctime_window.py`, `sync_delta.py` | GPU readback sync time per reason inside a time window. |
-| `drive.ps1`, `shot_window.ps1` | Keyboard input to and screenshots of the emulator window. |
-
 ## Environment switches added on this branch (selection)
 
 | Variable | Effect |
