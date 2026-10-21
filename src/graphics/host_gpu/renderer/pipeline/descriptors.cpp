@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdio>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -459,6 +460,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+/// Decode a guest texture descriptor and normalize its selected mip view before lookup.
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -575,6 +577,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 	} else {
 		desc.info.UpdateSize();
+	}
+	if (!desc.info.NormalizeMipView(view_base, view_levels)) {
+		EXIT("unsupported guest mip view: base=%u count=%u extent=%ux%ux%u\n",
+		     view_base, view_levels, width, height, volume ? depth : 1u);
 	}
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
@@ -836,7 +842,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {
-			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+			const bool write_only = resource.written && !resource.read && !resource.atomic;
+			binding.image_view =
+			    texture_cache.FindTexture(binding.image_id, binding.desc, write_only);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
@@ -915,6 +923,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// Ranges written by bound images, gathered once for all scalar reads of this draw.
+	std::vector<GuestRange> image_writes;
+	bool                    image_writes_gathered = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -923,17 +934,24 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
+		if (!image_writes_gathered) {
+			image_writes_gathered = true;
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						image_writes.push_back(written);
 					}
+				}
+			}
+		}
+		for (const auto [address, size]: reads) {
+			for (const auto written: image_writes) {
+				if (ImageRangeOverlaps(address, size, written.address, written.size)) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
 				}
 			}
 			for (const auto* writer: prepared_bindings) {
@@ -1047,6 +1065,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						                             : cache.GetFaultBuffer();
 						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
 						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
+						// Diagnostic (uncommitted): how often shaders need the 768 MiB table.
+						if (kind == BindingKind::BdaPagetable) {
+							static std::atomic_uint64_t bda_binds {0};
+							const auto count = ++bda_binds;
+							if ((count & (count - 1)) == 0) {
+								std::fprintf(stderr, "[bdadiag] BDA page table bound %llu times\n",
+								             static_cast<unsigned long long>(count));
+							}
+						}
 						write.pBufferInfo = &view;
 						break;
 					}

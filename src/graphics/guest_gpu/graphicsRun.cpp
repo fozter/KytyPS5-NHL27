@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/frameTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -24,10 +25,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <vector>
@@ -44,8 +48,22 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
+#if defined(KYTY_PGO_GENERATE)
+extern "C" int __llvm_profile_write_file(void); // NOLINT
+#endif
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+#if defined(KYTY_PGO_GENERATE)
+	// PGO training (uncommitted): write the cumulative profile (LLVM_PROFILE_FILE) every 30 s, so
+	// a closed or crashed session still leaves its counters.
+	std::thread([] {
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(30));
+			__llvm_profile_write_file();
+		}
+	}).detach();
+#endif
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
@@ -89,6 +107,22 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
+}
+
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) {
+		return false;
+	}
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
 }
 
 void GuestGpu::ProcessCommands() {
@@ -158,7 +192,9 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
+	FrameTrace('P', 0);
 	m_suspend_point_ready->acquire();
+	FrameTrace('A', 0);
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -412,6 +448,11 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	FrameTrace(submission.type == SubmissionType::Graphics         ? 'G'
+	           : submission.type == SubmissionType::Compute         ? 'C'
+	           : submission.type == SubmissionType::FlipPreparation ? 'F'
+	                                                                : 'S',
+	           submission.commands.size());
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -490,7 +531,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			FrameTrace('x', 0);
 			command();
+			FrameTrace('y', 0);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -501,7 +544,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		FrameTrace('b', static_cast<uint64_t>(submission.type));
 		const bool complete = gpu->Process(submission);
+		FrameTrace('e', complete ? 1u : 0u);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -593,8 +638,10 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			m_renderer.GetCommandScheduler().DeferPriorityOperation([ready = m_suspend_point_ready] {
+				FrameTrace('R', 0);
+				ready->release();
+			});
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -707,6 +754,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		// Diagnostic (uncommitted): NOP packets carry custom commands; tag syncs with the command
+		// (0x1000 | R code, printed as op10xx) instead of plain NOP.
+		g_sync_cp_op = opcode == Pm4::IT_NOP
+		                   ? static_cast<int>(0x1000u | KYTY_PM4_R(packet_header))
+		                   : static_cast<int>(opcode);
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -1043,7 +1095,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		case 0x03: with_interrupt = false; break;
 		case 0x01:
 			if (!IsAsyncComputeQueue()) {
+				// An interrupt-only EOP is a completion signal too: land pending readbacks first.
+				const bool queued = QueueReadbacksBeforeLabel();
 				TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				if (queued) {
+					GetScheduler().Flush();
+				}
 				return;
 			}
 			with_interrupt = true;
@@ -1057,6 +1114,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
+		if (PublishLabelAfterReadbacks(dst, data, sizeof(data), with_interrupt,
+		                               interrupt_context_id)) {
+			return;
+		}
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1069,7 +1130,16 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
+					(void)QueueReadbacksBeforeLabel();
 					SynchronizeGpu();
+					// SynchronizeGpu() waits for the GPU but not for priority callbacks: wait for
+					// readback copies and deferred labels queued by this or earlier EOPs.
+					GetScheduler().DrainPriorityOperations();
+					// Deferred labels are written by GPU-thread commands (see
+					// PublishLabelAfterReadbacks); run them so they land before this label.
+					if (g_gpu_state != nullptr) {
+						g_gpu_state->ProcessCommands();
+					}
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					if (with_interrupt) {
@@ -1100,6 +1170,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
+					if (PublishLabelAfterReadbacks(dst, static_cast<uint64_t>(value), sizeof(value),
+					                               with_interrupt, interrupt_context_id)) {
+						return;
+					}
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1201,10 +1275,66 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+// Queues pending image readbacks (see TextureCache::ProcessDownloadImages) ahead of a GPU
+// completion signal. Returns true if any were queued; the caller must then publish the signal
+// through a priority deferred operation so the guest observes it only after the data landed.
+bool CommandProcessor::QueueReadbacksBeforeLabel() {
+	Common::LockGuard lock(m_renderer.GetMutex());
+	return m_renderer.GetTextureCache().ProcessDownloadImages();
+}
+
+bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uint32_t size,
+                                                  bool with_interrupt,
+                                                  uint32_t interrupt_context_id) {
+	EXIT_IF(size != sizeof(uint32_t) && size != sizeof(uint64_t));
+	const bool queued = QueueReadbacksBeforeLabel();
+	// Priority operations run in FIFO order, so a label queued behind an earlier deferred label
+	// or an earlier readback (e.g. one queued at a suspend point) can never become visible
+	// before that data has landed.
+	// Experiment (uncommitted, §8.26/§8.7): KYTY_LABEL_DEFER_ALL=1 publishes EVERY end-of-pipe
+	// label only after the GPU completed the work before it (instead of when the CP parses it),
+	// to test whether eager labels let the game reuse data the GPU still reads (0x4506 / hair hangs).
+	static const bool defer_all = [] {
+		const char* value = std::getenv("KYTY_LABEL_DEFER_ALL");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!defer_all && !queued && m_labels_behind_readbacks->load(std::memory_order_acquire) == 0 &&
+	    !m_renderer.GetTextureCache().HasReadbacksInFlight()) {
+		return false;
+	}
+	m_labels_behind_readbacks->fetch_add(1, std::memory_order_acq_rel);
+	// The priority callback only hands the write to the GPU thread. The label's page can be
+	// tracked by the buffer cache (the GPU writes other bytes of it); a CPU write there faults
+	// into a buffer readback, which cannot run from a deferred operation. GPU-thread commands
+	// run in FIFO order between PM4 packets, so labels stay ordered, and the interrupt is raised
+	// by the same command after the label is visible.
+	GetScheduler().DeferPriorityOperation([&gpu = m_renderer.GetGpu(), &renderer = m_renderer,
+	                                       event_id = m_interrupt_event_id, dst, value, size,
+	                                       with_interrupt, interrupt_context_id,
+	                                       pending = m_labels_behind_readbacks] {
+		const bool sent = gpu.TrySendCommand([&renderer, event_id, dst, value, size,
+		                                      with_interrupt, interrupt_context_id, pending] {
+			std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
+			pending->fetch_sub(1, std::memory_order_acq_rel);
+			if (with_interrupt) {
+				renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			}
+		});
+		if (!sent) {
+			// The GPU is shutting down; nothing waits on the label any more.
+			pending->fetch_sub(1, std::memory_order_acq_rel);
+		}
+	});
+	GetScheduler().Flush();
+	return true;
+}
+
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
+	FrameTrace('q', interrupt_context_id);
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+		    FrameTrace('I', interrupt_context_id);
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 	    });
 }

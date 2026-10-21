@@ -46,7 +46,8 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      bool allow_host_memory = false);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -127,6 +128,7 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	bool             allocation_failed = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

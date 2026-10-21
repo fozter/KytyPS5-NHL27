@@ -33,6 +33,11 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// Deferred EOP labels hand their writes to the GPU object; let them run before it goes.
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.Finish();
+		}
+		m_command_scheduler.DrainPriorityOperations();
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
@@ -62,9 +67,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		const SyncReasonScope reason {"fault-write"};
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		const SyncReasonScope reason {"fault-read"};
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

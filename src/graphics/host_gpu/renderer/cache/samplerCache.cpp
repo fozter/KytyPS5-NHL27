@@ -5,7 +5,19 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics {
+
+namespace {
+
+// Local diagnostic: KYTY_FORCE_COMPARE_ALWAYS=1 makes every depth-compare sampler pass.
+bool ForceCompareAlways() {
+	static const bool enabled = std::getenv("KYTY_FORCE_COMPARE_ALWAYS") != nullptr;
+	return enabled;
+}
+
+} // namespace
 
 SamplerCache::~SamplerCache() {
 	for (const auto& [key, sampler]: m_samplers) {
@@ -132,6 +144,9 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
+	if (ForceCompareAlways() && sampler_info.compareEnable) {
+		sampler_info.compareOp = vk::CompareOp::eAlways;
+	}
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
 	sampler_info.borderColor             = border;

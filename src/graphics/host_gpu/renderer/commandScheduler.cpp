@@ -4,12 +4,73 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuCrashDiag.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <optional>
 
 namespace Libs::Graphics {
+
+// Diagnostic (uncommitted): GPU timeline. KYTY_GPU_TIMELINE=1 writes a timestamp at the start and
+// the end of every submitted command buffer; once a submission completes, its pair is read back
+// and every ~2 s of wall time a [gputimeline] line reports submissions, GPU busy time, the idle
+// gaps between consecutive submissions and the longest gap.
+namespace GpuTimeline {
+static const bool kEnabled = std::getenv("KYTY_GPU_TIMELINE") != nullptr;
+constexpr uint32_t kPairs   = 4096;
+static vk::QueryPool g_pool         = nullptr;
+static uint32_t      g_next_pair    = 0;
+static uint32_t      g_current_pair = UINT32_MAX;
+static double        g_ns_per_tick  = 1.0;
+static std::mutex    g_mutex;
+static std::chrono::steady_clock::time_point g_window_start {};
+static uint64_t g_submits = 0, g_last_end = 0, g_gaps_over_1ms = 0, g_cpu_submits = 0;
+static double   g_busy_ns = 0, g_gap_ns = 0, g_max_gap_ns = 0, g_max_busy_ns = 0;
+
+static void Record(uint64_t start, uint64_t end) {
+	std::scoped_lock lock {g_mutex};
+	const auto now = std::chrono::steady_clock::now();
+	if (g_window_start == std::chrono::steady_clock::time_point {}) {
+		g_window_start = now;
+	}
+	if (end > start) {
+		const double busy = static_cast<double>(end - start) * g_ns_per_tick;
+		g_busy_ns += busy;
+		g_max_busy_ns = std::max(g_max_busy_ns, busy);
+	}
+	if (g_last_end != 0 && start > g_last_end) {
+		const double gap = static_cast<double>(start - g_last_end) * g_ns_per_tick;
+		g_gap_ns += gap;
+		g_max_gap_ns = std::max(g_max_gap_ns, gap);
+		g_gaps_over_1ms += gap > 1e6 ? 1 : 0;
+	}
+	g_last_end = std::max(g_last_end, end);
+	g_submits++;
+	const double wall_ms =
+	    std::chrono::duration<double, std::milli>(now - g_window_start).count();
+	if (wall_ms >= 2000.0) {
+		std::fprintf(stderr,
+		             "[gputimeline] %.0f ms wall: %llu submits (%.0f/s), GPU busy %.0f ms (%.0f%%), "
+		             "idle gaps %.0f ms (%.0f%%), %llu gaps > 1 ms, max gap %.1f ms, max submit "
+		             "%.1f ms, avg submit %.3f ms\n",
+		             wall_ms, static_cast<unsigned long long>(g_submits),
+		             static_cast<double>(g_submits) * 1000.0 / wall_ms, g_busy_ns / 1e6,
+		             g_busy_ns / 1e4 / wall_ms, g_gap_ns / 1e6, g_gap_ns / 1e4 / wall_ms,
+		             static_cast<unsigned long long>(g_gaps_over_1ms), g_max_gap_ns / 1e6,
+		             g_max_busy_ns / 1e6,
+		             g_submits != 0 ? g_busy_ns / 1e6 / static_cast<double>(g_submits) : 0.0);
+		std::fflush(stderr);
+		g_window_start = now;
+		g_submits      = 0;
+		g_busy_ns = g_gap_ns = g_max_gap_ns = g_max_busy_ns = 0;
+		g_gaps_over_1ms = 0;
+	}
+}
+} // namespace GpuTimeline
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
@@ -27,6 +88,7 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	GpuCrashDiag::Report(what, result);
 }
 
 } // namespace
@@ -336,6 +398,24 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	if (GpuTimeline::kEnabled) {
+		if (GpuTimeline::g_pool == nullptr) {
+			vk::QueryPoolCreateInfo info {};
+			info.queryType  = vk::QueryType::eTimestamp;
+			info.queryCount = GpuTimeline::kPairs * 2;
+			EXIT_NOT_IMPLEMENTED(m_graphics.device.createQueryPool(&info, nullptr,
+			                                                       &GpuTimeline::g_pool) !=
+			                     vk::Result::eSuccess);
+			GpuTimeline::g_ns_per_tick =
+			    m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		}
+		const auto pair = GpuTimeline::g_next_pair++ % GpuTimeline::kPairs;
+		const auto handle = m_command.Handle();
+		handle.resetQueryPool(GpuTimeline::g_pool, pair * 2, 2);
+		handle.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, GpuTimeline::g_pool,
+		                      pair * 2);
+		GpuTimeline::g_current_pair = pair;
+	}
 	return m_command;
 }
 
@@ -344,6 +424,24 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (GpuTimeline::kEnabled && GpuTimeline::g_current_pair != UINT32_MAX) {
+		const auto pair = GpuTimeline::g_current_pair;
+		GpuTimeline::g_current_pair = UINT32_MAX;
+		m_command.EndRendering();
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+		                                  GpuTimeline::g_pool, pair * 2 + 1);
+		// Queued before NextTick below, so it runs once this submission completes. Submissions
+		// outside an active command context (start-up) are not timed.
+		if (Active()) DeferOperation([device = m_graphics.device, pair] {
+			uint64_t values[2] {};
+			if (device.getQueryPoolResults(GpuTimeline::g_pool, pair * 2, 2, sizeof(values),
+			                               values, sizeof(uint64_t),
+			                               vk::QueryResultFlagBits::e64) ==
+			    vk::Result::eSuccess) {
+				GpuTimeline::Record(values[0], values[1]);
+			}
+		});
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

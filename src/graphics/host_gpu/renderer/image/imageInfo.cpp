@@ -2,8 +2,32 @@
 
 #include "common/alignment.h"
 
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <tuple>
+
 namespace Libs::Graphics {
 namespace {
+
+// Local diagnostic: prints each distinct volume texture shape once (NHL 27 lighting probes).
+void LogVolumeOnce(const ImageInfo& info) {
+	static std::mutex                                                          mutex;
+	static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> seen;
+	const auto key = std::make_tuple(static_cast<uint32_t>(info.guest_format),
+	                                 static_cast<uint32_t>(info.tile_mode), info.extent.width,
+	                                 info.extent.height, info.extent.depth, info.resources.levels);
+	std::lock_guard lock(mutex);
+	if (seen.insert(key).second) {
+		std::printf("[volume-texture] addr=0x%016llx format=%u tile=0x%02x size=%ux%ux%u levels=%u "
+		            "layers=%u pitch=%u data_size=0x%llx\n",
+		            static_cast<unsigned long long>(info.data.address),
+		            static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+		            info.extent.width, info.extent.height, info.extent.depth,
+		            info.resources.levels, info.resources.layers, info.pitch,
+		            static_cast<unsigned long long>(info.data.size));
+	}
+}
 
 uint64_t Multiply(uint64_t left, uint64_t right) {
 	EXIT_IF(right != 0 && left > UINT64_MAX / right);
@@ -76,7 +100,57 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 	        IsVolume() ? std::max(extent.depth >> level, 1u) : resources.layers};
 }
 
+/// Represent a guest mip view within host limits while preserving its physical layout.
+bool ImageInfo::NormalizeMipView(uint32_t& base_level, uint32_t level_count) {
+	if (level_count == 0 || base_level >= resources.levels ||
+	    level_count > resources.levels - base_level) return false;
+	const auto limit = static_cast<uint32_t>(
+	    std::bit_width(std::max({extent.width, extent.height, extent.depth})));
+	if (resources.levels <= limit) return true;
+	// Rebase a selected extra mip instead of dropping an accessible guest level.
+	const auto first = base_level + level_count <= limit ? 0u : base_level;
+	const vk::Extent3D selected {std::max(extent.width >> first, 1u),
+	                            std::max(extent.height >> first, 1u),
+	                            std::max(extent.depth >> first, 1u)};
+	const auto selected_limit = static_cast<uint32_t>(
+	    std::bit_width(std::max({selected.width, selected.height, selected.depth})));
+	if (level_count > selected_limit || guest_mip_levels != 0 || HasMetadata() ||
+	    IsDepth() || samples != 1) return false;
+	guest_mip_extent = extent;
+	guest_mip_levels = resources.levels;
+	guest_base_mip = first;
+	extent = selected;
+	resources.levels = std::min(resources.levels - first, selected_limit);
+	base_level -= first;
+	UpdateSize();
+	return true;
+}
+
+/// Compute guest storage layouts, retaining original offsets for rebased mip views.
 void ImageInfo::UpdateSize() {
+	if (guest_mip_levels != 0) {
+		EXIT_IF(guest_base_mip >= guest_mip_levels || resources.levels == 0 ||
+		        resources.levels > guest_mip_levels - guest_base_mip);
+		auto physical = *this;
+		physical.extent = guest_mip_extent;
+		physical.resources.levels = guest_mip_levels;
+		physical.guest_mip_levels = 0;
+		physical.guest_base_mip = 0;
+		physical.UpdateSize();
+		data = physical.data;
+		pitch = physical.pitch;
+		bytes_per_block = physical.bytes_per_block;
+		tiling = physical.tiling;
+		tiled_slice_stride = physical.tiled_slice_stride;
+		linear_slice_stride = physical.linear_slice_stride;
+		first_tail_level = physical.first_tail_level > guest_base_mip
+		                       ? physical.first_tail_level - guest_base_mip : 0;
+		mip_layout = {};
+		for (uint32_t level = 0; level < resources.levels; ++level) {
+			mip_layout[level] = physical.mip_layout[guest_base_mip + level];
+		}
+		return;
+	}
 	EXIT_IF(guest_format == Prospero::BufferFormat::kInvalid || extent.width == 0 ||
 	        extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||
 	        resources.levels > mip_layout.size() || resources.layers == 0 || samples == 0 ||
@@ -124,6 +198,9 @@ void ImageInfo::UpdateSize() {
 		pitch = TileGetTexturePitch(guest_format, extent.width, tile_mode);
 	}
 	EXIT_IF(pitch == 0);
+	if (IsVolume()) {
+		LogVolumeOnce(*this);
+	}
 	if (IsDepthPlane(*this) && resources.levels == 1) {
 		EXIT_NOT_IMPLEMENTED(IsVolume());
 		if (IsTiled()) {

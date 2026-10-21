@@ -1,0 +1,50 @@
+#version 450
+// Copies guest indirect dispatch arguments into a host-owned slot, zeroing all three group
+// counts when one exceeds the device limits or the dispatch exceeds the total group budget.
+// NHL 27 sometimes dispatches with leftover data in its argument slot (19 x 903218951 x 19
+// groups); Vulkan leaves counts past maxComputeWorkGroupCount undefined, and NVIDIA either drops
+// such a dispatch or runs it for seconds (GPU freeze, TDR).
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Arguments {
+	uint arguments[];
+};
+
+layout(std430, binding = 1) writeonly buffer Guarded {
+	uint guarded[];
+};
+
+// [0] dispatches zeroed so far.
+layout(std430, binding = 2) buffer Stats {
+	uint zeroed;
+};
+
+layout(push_constant) uniform Parameters {
+	// Dword offsets of the arguments and the slot inside their aligned descriptors.
+	uint arguments_base;
+	uint guarded_base;
+	uint max_x;
+	uint max_y;
+	uint max_z;
+	uint max_total;
+} parameters;
+
+void main() {
+	const uint x = arguments[parameters.arguments_base];
+	const uint y = arguments[parameters.arguments_base + 1u];
+	const uint z = arguments[parameters.arguments_base + 2u];
+	bool too_large = x > parameters.max_x || y > parameters.max_y || z > parameters.max_z;
+	if (!too_large && x != 0u && y != 0u && z != 0u) {
+		// x * y * z > max_total without 64-bit integers.
+		too_large = y > parameters.max_total / x;
+		if (!too_large) {
+			too_large = z > parameters.max_total / (x * y);
+		}
+	}
+	guarded[parameters.guarded_base]      = too_large ? 0u : x;
+	guarded[parameters.guarded_base + 1u] = too_large ? 0u : y;
+	guarded[parameters.guarded_base + 2u] = too_large ? 0u : z;
+	if (too_large) {
+		atomicAdd(zeroed, 1u);
+	}
+}

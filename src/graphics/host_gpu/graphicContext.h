@@ -47,6 +47,15 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Readback-queue path (uncommitted perf work): a second queue of the same
+	// family downloads GPU-written buffer data waiting only on the writing
+	// submission's timeline tick, so CPU readbacks stop draining the whole
+	// command pipeline (NHL 27: 611k full-pipeline drains per session, 27 min
+	// of cumulative wait). All null when the family has a single queue, in
+	// which case the old synchronous path stays in use.
+	uint32_t                           readback_queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                          readback_queue        = nullptr;
+	vk::CommandPool                    readback_pool         = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -109,7 +118,9 @@ struct GraphicContext {
 		bool     device_local = false;
 	};
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// allow_host_memory: fall back to system memory when device memory is exhausted.
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	                                   bool allow_host_memory = false);
 	void                   DeleteImage(VulkanImage& image);
 
 	uint32_t screen_width  = 0;

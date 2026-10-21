@@ -15,6 +15,7 @@
 #include <bitset>
 #include <map>
 #include <type_traits>
+#include <atomic>
 #include <unordered_set>
 #include <vector>
 
@@ -54,9 +55,14 @@ public:
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
-	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// write_only: a storage binding the shader only writes (no reads or atomics).
+	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc,
+	                                        bool write_only = false);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// cleared_aspects: aspects the attachment load clears over the whole image, so their guest
+	// memory is not uploaded first.
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            vk::ImageAspectFlags cleared_aspects = {});
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -67,7 +73,8 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// diag_source (diagnostic, uncommitted): 0 shader storage write, 1 fill, 2 copy.
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, int diag_source = 0);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -76,10 +83,18 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
-	void ProcessDownloadImages();
+	/// Records GPU-to-guest copies for enrolled images. Entries that fail transiently stay
+	/// enrolled; entries that can never be downloaded are dropped.
+	/// @return true if at least one copy was queued (its guest write lands as a priority op).
+	bool ProcessDownloadImages();
+	/// @return true while a queued readback has not yet been written to guest memory.
+	[[nodiscard]] bool HasReadbacksInFlight() const noexcept {
+		return m_readbacks_in_flight.load(std::memory_order_acquire) != 0;
+	}
 	void RunGarbageCollector();
 
 private:
+	bool EvictForAllocation(ImageId keep, uint64_t needed);
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
@@ -111,7 +126,8 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	// keep: an image the caller still uses after the insert; eviction leaves it alone.
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, ImageId keep = {});
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -125,6 +141,9 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	/// Enrolls a GPU-written image for readback if it is tiny (1 layer, 1 level, <= 64 texels).
+	/// @return true if the image qualified (whether or not it was already enrolled).
+	bool                      EnrollTinyReadback(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -138,6 +157,9 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	void                        DiscardImageContents(ImageId id);
+	// Experiment (uncommitted): KYTY_TRANSIENT level, alternated by KYTY_AB.
+	[[nodiscard]] int           TransientLevel() const;
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -187,6 +209,8 @@ private:
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
+	// Readbacks recorded by DownloadImageMemory() whose guest write has not run yet.
+	std::atomic<uint32_t> m_readbacks_in_flight {0};
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

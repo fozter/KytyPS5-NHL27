@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -691,7 +693,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
+             bool allow_host_memory)
     : info(image_info),
       stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
       m_graphics(graphics), m_scheduler(scheduler) {
@@ -727,10 +730,10 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+	if (!graphics.CreateImage(create, backing, allow_host_memory)) {
+		// Out of device memory: the texture cache evicts and retries (TextureCache::InsertImage).
+		allocation_failed = true;
+		return;
 	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,
@@ -738,6 +741,13 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
 	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
 	    info.samples);
+	if (std::getenv("KYTY_IMG_LOG") != nullptr) {
+		LOGF("img+ guest=0x%016" PRIx64 " gsize=0x%" PRIx64 " %ux%ux%u fmt=%d mips=%u layers=%u "
+		     "samples=%u\n",
+		     info.data.address, info.data.size, info.extent.width, info.extent.height,
+		     info.extent.depth, static_cast<int>(info.pixel_format), info.resources.levels,
+		     info.resources.layers, info.samples);
+	}
 }
 
 uint64_t Image::HashGuestEdges() const {
@@ -761,6 +771,11 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	if (backing.image != nullptr && std::getenv("KYTY_IMG_LOG") != nullptr) {
+		LOGF("img- guest=0x%016" PRIx64 " gsize=0x%" PRIx64 " %ux%ux%u fmt=%d\n",
+		     info.data.address, info.data.size, info.extent.width, info.extent.height,
+		     info.extent.depth, static_cast<int>(info.pixel_format));
+	}
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);

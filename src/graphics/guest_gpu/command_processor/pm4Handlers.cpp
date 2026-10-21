@@ -952,6 +952,16 @@ static void HwShIgnoreComputeRegister([[maybe_unused]] uint32_t cmd_offset,
 static void HwShIgnoreShaderRegister([[maybe_unused]] uint32_t cmd_offset,
                                      [[maybe_unused]] uint32_t value) {}
 
+// Diagnostic (uncommitted): the first writes to the HS/LS program registers, to tell whether
+// 0x14a/0x14b carry a program address (pinkton, #1101) or LS resource bits (our 0005).
+static void DiagShProgramRegister(uint32_t cmd_offset, uint32_t value) {
+	static std::atomic_uint32_t printed[6] {};
+	const uint32_t index = cmd_offset >= 0x148 ? 2 + (cmd_offset - 0x148) : cmd_offset - 0x108;
+	if (index < 6 && printed[index].fetch_add(1, std::memory_order_relaxed) < 24) {
+		std::fprintf(stderr, "[shregdiag] 0x%03x = 0x%08x\n", cmd_offset, value);
+	}
+}
+
 KYTY_HW_SH_PARSER(HwShSetRegisters) {
 	const auto reg_num = (cmd_id >> 16u) & 0x3fffu;
 	EXIT_NOT_IMPLEMENTED(reg_num == 0);
@@ -3619,6 +3629,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		};
 	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		DiagShProgramRegister(cmd_offset, value);
 		auto base = cp.GetShCtx().GetVs().hs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
 		base |= static_cast<uint64_t>(value) << 8u;
@@ -3626,6 +3637,7 @@ void GraphicsInitJmpTablesShIndirect() {
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_HI_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		DiagShProgramRegister(cmd_offset, value);
 		auto base = cp.GetShCtx().GetVs().hs_regs.data_addr;
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
@@ -3659,6 +3671,7 @@ void GraphicsInitJmpTablesShIndirect() {
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		DiagShProgramRegister(cmd_offset, value);
 		auto base = cp.GetShCtx().GetVs().ls_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
 		base |= static_cast<uint64_t>(value) << 8u;
@@ -3666,11 +3679,34 @@ void GraphicsInitJmpTablesShIndirect() {
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_HI_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		DiagShProgramRegister(cmd_offset, value);
 		auto base = cp.GetShCtx().GetVs().ls_regs.data_addr;
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
 		cp.GetShCtx().SetLsShaderBase(base);
 	};
+
+	// Toolkit state restoration also writes the legacy LS resource registers (our 0005):
+	// upstream instead treats 0x14a/0x14b as removed registers and EXITs on the write,
+	// which ends NHL 27 when the players reach the ice (issue #1101, user report
+	// 2026-10-18). The merged LS-HS stage takes its resources from SPI_SHADER_PGM_RSRC1/2_HS,
+	// so these copies have no effect either way. On by default, so every launcher keeps the
+	// game alive; the compute tests set KYTY_SH_LEGACY_LS=0 to keep upstream's dispatch-table
+	// regression check ("legacy register holes") meaningful.
+	static const bool legacy_ls_handlers = [] {
+		const char* value = std::getenv("KYTY_SH_LEGACY_LS");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (legacy_ls_handlers) {
+		g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			DiagShProgramRegister(cmd_offset, value);
+			HwShIgnoreShaderRegister(cmd_offset, value);
+		};
+		g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			DiagShProgramRegister(cmd_offset, value);
+			HwShIgnoreShaderRegister(cmd_offset, value);
+		};
+	}
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().es_regs.data_addr;

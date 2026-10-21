@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/gpuCrashDiag.h"
 
 #include <array>
 
@@ -119,6 +120,9 @@ vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 
 void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			GpuCrashDiag::Report(operation, result);
+		}
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));
 	}

@@ -12,11 +12,13 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/diagSampler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -27,9 +29,12 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
+#include <set>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -109,14 +114,74 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	KYTY_PROFILER_BLOCK("Srt:StrictRead");
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
+	// Experiment (uncommitted): KYTY_SRT_BRANCH_BOTH=1 leaves a branch condition on GPU-written
+	// bytes undecided instead of waiting for the GPU; the resource walk then takes both successors
+	// (the GPU still takes the real branch). Idea from pengui07/KytyPS5-nhl
+	// (KYTY_GPU_CONDITIONS_BOTH_PATHS), where NHL 27 runs it by default.
+	static const bool branch_both = [] {
+		const char* value = std::getenv("KYTY_SRT_BRANCH_BOTH");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (branch_both && ShaderRecompiler::IR::g_srt_read_role == 1) {
+		const bool read = !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
+		                                         address, values.data(), values.size_bytes());
+		if (!read) ShaderRecompiler::IR::g_srt_branch_declines++;
+		return read;
+	}
+	const SyncReasonScope reason {ShaderRecompiler::IR::g_srt_read_role == 1 ? "shader-resource-read(branch)"
+	                                                                          : "shader-resource-read"};
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// KYTY_DUMP_SHADERS=<hash>[,<hash>...] dumps the guest code, its disassembly and the SPIR-V of
+// the listed shaders into _shader_dump without enabling the (very large) graphics debug dump.
+bool IsTargetedShaderDump(uint64_t shader_hash) {
+	// KYTY_DUMP_SHADERS=all dumps every shader.
+	static const bool all = [] {
+		const char* env = std::getenv("KYTY_DUMP_SHADERS");
+		return env != nullptr && std::string_view(env) == "all";
+	}();
+	if (all) {
+		return true;
+	}
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		const char*           env = std::getenv("KYTY_DUMP_SHADERS");
+		for (const char* p = env; p != nullptr && *p != '\0';) {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(p, &end, 16);
+			if (end == p) {
+				break;
+			}
+			result.push_back(value);
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return result;
+	}();
+	return std::ranges::find(hashes, shader_hash) != hashes.end();
+}
+
+void DumpTargetedShader(const char* stage_name, uint64_t shader_hash, const char* extension,
+                        const void* data, size_t size) {
+	const auto path = std::filesystem::path("_shader_dump") /
+	                  fmt::format("{}_{:016x}.{}", stage_name, shader_hash, extension);
+	Common::File::CreateDirectories(path.parent_path());
+	if (auto* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+		std::fwrite(data, 1, size, file);
+		std::fclose(file);
+	}
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
+	if (IsTargetedShaderDump(shader_hash)) {
+		DumpTargetedShader(stage_name, shader_hash, "spv", spirv.data(),
+		                   spirv.size() * sizeof(uint32_t));
+	}
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
@@ -133,8 +198,90 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
 }
 
+// KYTY_REPLACE_SHADERS=<hash16>=<file>[;...] replaces the emitted SPIR-V of the listed
+// shaders with the file contents before shader module creation (debugging aid).
+std::vector<uint32_t> ReplaceTargetedShader(const char* stage_name, uint64_t shader_hash,
+                                            std::vector<uint32_t>&& spirv) {
+	static const std::vector<std::pair<uint64_t, std::string>> replacements = [] {
+		std::vector<std::pair<uint64_t, std::string>> result;
+		const char* env = std::getenv("KYTY_REPLACE_SHADERS");
+		for (const char* p = env; p != nullptr && *p != '\0';) {
+			char* end = nullptr;
+			const auto hash = std::strtoull(p, &end, 16);
+			if (end == p || *end != '=') {
+				break;
+			}
+			const char* path = end + 1;
+			const char* sep  = std::strchr(path, ';');
+			result.emplace_back(hash, sep != nullptr ? std::string(path, sep) : std::string(path));
+			p = sep != nullptr ? sep + 1 : path + std::strlen(path);
+		}
+		return result;
+	}();
+	for (const auto& [hash, file] : replacements) {
+		if (hash != shader_hash) {
+			continue;
+		}
+		if (auto* fp = std::fopen(file.c_str(), "rb"); fp != nullptr) {
+			std::fseek(fp, 0, SEEK_END);
+			const auto size = std::ftell(fp);
+			std::fseek(fp, 0, SEEK_SET);
+			std::vector<uint32_t> data((size + 3) / 4);
+			const auto read = std::fread(data.data(), 1, size, fp);
+			std::fclose(fp);
+			data.resize(read / 4);
+			LOGF("%s hash=0x%016" PRIx64 ": SPIR-V replaced from %s (%" PRIu64 " words)\n",
+			     stage_name, hash, file.c_str(), static_cast<uint64_t>(data.size()));
+			return data;
+		}
+		LOGF("KYTY_REPLACE_SHADERS: file not found for hash=0x%016" PRIx64 ": %s\n", hash,
+		     file.c_str());
+	}
+	return std::move(spirv);
+}
+
+// Diagnostic (uncommitted): disassembly of each shader whose resource specialization needed a
+// GPU readback, once per shader (_shader_dump/srt<stage>_<hash>.txt).
+void DumpSrtReader(ShaderType stage, uint64_t shader_hash, std::span<const uint32_t> code) {
+	static std::set<uint64_t> dumped;
+	if (code.empty() || !dumped.insert(shader_hash).second) {
+		return;
+	}
+	ShaderRecompiler::Decoder::Program program;
+	ShaderRecompiler::Decoder::DecodeProgram(code, program);
+	std::string text;
+	for (const auto& inst: program.instructions) {
+		text += fmt::format("{:08x}: {}\n", inst.pc, ShaderRecompiler::Decoder::InstructionToString(inst));
+	}
+	const auto name = fmt::format("srt{}", static_cast<int>(stage));
+	DumpTargetedShader(name.c_str(), shader_hash, "txt", text.data(), text.size());
+}
+
+struct SrtReaderScope {
+	ShaderType                stage;
+	uint64_t                  hash;
+	std::span<const uint32_t> code;
+	uint64_t                  readbacks_before = g_srt_readbacks;
+	~SrtReaderScope() {
+		if (g_srt_readbacks != readbacks_before) {
+			DumpSrtReader(stage, hash, code);
+		}
+	}
+};
+
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
+	if (IsTargetedShaderDump(shader_hash) && !code.empty()) {
+		DumpTargetedShader(stage_name, shader_hash, "bin", code.data(), code.size_bytes());
+		ShaderRecompiler::Decoder::Program program;
+		ShaderRecompiler::Decoder::DecodeProgram(code, program);
+		std::string text;
+		for (const auto& inst: program.instructions) {
+			text += fmt::format("{:08x}: {}\n", inst.pc,
+			                    ShaderRecompiler::Decoder::InstructionToString(inst));
+		}
+		DumpTargetedShader(stage_name, shader_hash, "txt", text.data(), text.size());
+	}
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
@@ -237,6 +384,9 @@ struct PipelineCache::ProgramCache {
 			permutations.reserve(8);
 		}
 
+		uint64_t diag_last_input_hash = 0;
+		uint64_t diag_last_user_hash  = 0;
+
 		std::span<const uint32_t> FunctionCode() const {
 			return call_source
 			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
@@ -253,8 +403,38 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			{
+				KYTY_PROFILER_BLOCK("Prog:Materialize");
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    resource_plan, runtime, resources, specialization));
+			}
+			{
+				// Diagnostic (uncommitted): upper bound for a materialization memo - calls whose
+				// user data and flattened resource-table words equal this program's last call.
+				uint64_t hash = XXH3_64bits(resources.user_data.data(),
+				                            resources.user_data.size() * sizeof(uint32_t));
+				hash ^= XXH3_64bits(resources.flattened_srt.data(),
+				                    resources.flattened_srt.size() * sizeof(uint32_t)) * 31u;
+				static uint64_t memo_calls = 0, memo_same = 0, memo_same_user = 0;
+				const uint64_t user_hash = XXH3_64bits(resources.user_data.data(),
+				                                       resources.user_data.size() * sizeof(uint32_t));
+				memo_calls++;
+				memo_same += hash == diag_last_input_hash ? 1 : 0;
+				memo_same_user += user_hash == diag_last_user_hash ? 1 : 0;
+				diag_last_input_hash = hash;
+				diag_last_user_hash  = user_hash;
+				if (memo_calls % (1u << 20u) == 0) {
+					std::fprintf(stderr,
+					             "[matmemo] %llu materializations: inputs equal to the program's "
+					             "last call %.1f%%, user data equal %.1f%%\n",
+					             static_cast<unsigned long long>(memo_calls),
+					             100.0 * static_cast<double>(memo_same) / static_cast<double>(memo_calls),
+					             100.0 * static_cast<double>(memo_same_user) /
+					                 static_cast<double>(memo_calls));
+					std::fflush(stderr);
+				}
+			}
+			KYTY_PROFILER_BLOCK("Prog:MatchPermutation");
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -305,8 +485,11 @@ struct PipelineCache::ProgramCache {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
+		// Diagnostic (uncommitted): per-stage first-compile timing to stderr.
+		const auto diag_t0 = std::chrono::steady_clock::now();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		const auto diag_t1 = std::chrono::steady_clock::now();
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
 		                         options.profile->maintenance8)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
@@ -314,13 +497,27 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		// Diagnostic (uncommitted): SPIR-V fingerprint, to prove recompiler speedups change no output.
+		std::fprintf(stderr, "[spvhash] %s %016" PRIx64 " %016" PRIx64 " words=%zu\n", stage_name,
+		             options.shader_hash,
+		             XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t)),
+		             result.spirv.size());
 
-		const auto module = CompileSPV(result.spirv, graphics.device);
+		auto       spirv_for_module = ReplaceTargetedShader(stage_name, options.shader_hash,
+		                                                  std::move(result.spirv));
+		const auto module          = CompileSPV(spirv_for_module, graphics.device);
+		const auto diag_t2         = std::chrono::steady_clock::now();
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		std::fprintf(stderr,
+		             "[shaderdiag] %s %016" PRIx64 " compile_program=%.1fms spv_module=%.1fms\n",
+		             stage_name, options.shader_hash,
+		             std::chrono::duration<double, std::milli>(diag_t1 - diag_t0).count(),
+		             std::chrono::duration<double, std::milli>(diag_t2 - diag_t1).count());
+		std::fflush(stderr);
 		return {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
@@ -347,8 +544,17 @@ struct PipelineCache::ProgramCache {
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		std::optional<tracy::ScopedZone> key_zone;
+		{
+			static constexpr tracy::SourceLocationData key_location {
+			    "Prog:Key", TracyFunction, TracyFile, static_cast<uint32_t>(__LINE__), 0};
+			key_zone.emplace(&key_location, TRACY_CALLSTACK, tracy::ProfilerAvailable());
+		}
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		g_srt_reader = params.hash;
+		const SrtReaderScope srt_reader {stage, params.hash, params.code};
 		auto                                         entry = programs.find(lookup_key);
+		key_zone.reset();
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -396,6 +602,8 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
+		// Diagnostic (uncommitted): samples the whole first-use compile (KYTY_DIAG_SAMPLER=1).
+		DiagSampler::Scope diag_sampler_scope;
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.profile     = &profile;
@@ -420,6 +628,7 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
+		const auto diag_t0 = std::chrono::steady_clock::now();
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		if (source.unsupported_call_pc != UINT32_MAX) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
@@ -429,6 +638,7 @@ struct PipelineCache::ProgramCache {
 			    .first->second.skip_dispatch = true;
 			return {};
 		}
+		const auto diag_t1 = std::chrono::steady_clock::now();
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
@@ -442,6 +652,7 @@ struct PipelineCache::ProgramCache {
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+		const auto diag_t2 = std::chrono::steady_clock::now();
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
@@ -457,6 +668,14 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
+		const auto diag_t3 = std::chrono::steady_clock::now();
+		std::fprintf(stderr,
+		             "[shaderdiag] %s %016" PRIx64 " prep=%.1fms translate=%.1fms plan=%.1fms\n",
+		             stage_name, options.shader_hash,
+		             std::chrono::duration<double, std::milli>(diag_t1 - diag_t0).count(),
+		             std::chrono::duration<double, std::milli>(diag_t2 - diag_t1).count(),
+		             std::chrono::duration<double, std::milli>(diag_t3 - diag_t2).count());
+		std::fflush(stderr);
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
@@ -684,10 +903,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
-	if (tess_active) {
-		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
-	} else {
-		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+	{
+		// Profiling zones "Prog:*" (uncommitted): where RefreshShaders spends its time.
+		KYTY_PROFILER_BLOCK("Prog:PrepareVertex");
+		if (tess_active) {
+			vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		} else {
+			vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
@@ -721,6 +944,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
+		KYTY_PROFILER_BLOCK("Prog:PreparePixel");
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
