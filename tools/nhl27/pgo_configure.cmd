@@ -3,7 +3,7 @@ rem Reconfigures _Build\windows for PGO (instructions 8.26). Usage:
 rem   pgo_configure.cmd generate          instrumented build (KYTY_PGO_GENERATE=ON)
 rem   pgo_configure.cmd use <profdata>    optimized with the merged profile
 rem   pgo_configure.cmd off               back to the plain build
-rem Then build_target.cmd. Every switch rebuilds everything.
+rem Then build (cmake --build _Build/windows). Every switch rebuilds everything.
 setlocal
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1
