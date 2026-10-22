@@ -49,18 +49,22 @@ static bool GraphicsRunDebugDumpEnabled() {
 }
 
 #if defined(KYTY_PGO_GENERATE)
-extern "C" int __llvm_profile_write_file(void); // NOLINT
+extern "C" int  __llvm_profile_write_file(void);     // NOLINT
+extern "C" void __llvm_profile_reset_counters(void); // NOLINT
 #endif
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 #if defined(KYTY_PGO_GENERATE)
-	// PGO training (uncommitted): write the cumulative profile (LLVM_PROFILE_FILE) every 30 s, so
-	// a closed or crashed session still leaves its counters.
+	// PGO training: write the profile (LLVM_PROFILE_FILE) every 30 s, so a closed or crashed
+	// session still leaves its counters. The runtime appends each write to the file, so the
+	// counters restart after every write: the file holds 30 s pieces that llvm-profdata merge sums
+	// to the session's totals (cumulative snapshots would count the boot once per write).
 	std::thread([] {
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::seconds(30));
 			__llvm_profile_write_file();
+			__llvm_profile_reset_counters();
 		}
 	}).detach();
 #endif

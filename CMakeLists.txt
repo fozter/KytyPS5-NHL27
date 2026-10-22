@@ -217,6 +217,15 @@ elseif(KYTY_PGO_USE)
 	add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
 	                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
 endif()
+# ThinLTO for the Release build: optimization across translation units at link time (llvm-lib keeps
+# the bitcode in static libraries, lld-link runs the LTO backends on all cores and caches their
+# output, so a relink after a small change only reoptimizes the modules it touched).
+option(KYTY_THIN_LTO "ThinLTO for the Release build (clang-cl + lld-link)" OFF)
+if(KYTY_THIN_LTO)
+	add_compile_options("$<$<CONFIG:Release>:-flto=thin>")
+	add_link_options("$<$<CONFIG:Release>:/opt:lldltojobs=all>"
+	                 "$<$<CONFIG:Release>:/lldltocache:${CMAKE_BINARY_DIR}/thinlto-cache>")
+endif()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")

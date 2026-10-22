@@ -13,7 +13,7 @@ emulator checkout as `KytyPS5`).
 | File | Purpose |
 | --- | --- |
 | `run_nhl_silent_tess.cmd` | Launcher with the branch's defaults (1080p output, tessellation, dense SRT walker, fault emulation, IR validator off). Any default can be overridden by setting the variable before launching. |
-| `pgo_configure.cmd` | `generate` (instrumented build), `use <profdata>`, `off`: profile-guided optimization. |
+| `pgo_configure.cmd` | Profile-guided optimization: `generate` (instrumented build), `use <profdata>` (optimized with the merged profile, plus ThinLTO), `lto` (ThinLTO only), `off`. |
 | `symbolize_samples.py` | Profiles from `KYTY_DIAG_SAMPLER` captures; `--threads` and `--timeline` for all-thread captures (mode 3). |
 | `cmp_spvhash.py` | SPIR-V equality and per-shader compile-phase timings between two boots. |
 
