@@ -11,10 +11,6 @@ set "EXEDIR=%ROOT%\KytyPS5\_Build\windows"
 rem The game: the ZArchive by default (2026-10-21: 205 GB packed to 57 GB; run 122 = same load
 rem times and fps as the folder, which was then removed). KYTY_GAME=<dir|zar> runs another one.
 if not defined KYTY_GAME set "KYTY_GAME=%ROOT%\NHL27_PPSA34063.zar"
-rem The window opens on the second screen (user's wish, 2026-10-22); KYTY_WINDOW_DISPLAY=<n> picks
-rem another display, KYTY_WINDOW_DISPLAY=0 the first one SDL lists.
-if not defined KYTY_WINDOW_DISPLAY set "KYTY_WINDOW_DISPLAY=secondary"
-if not defined KYTY_WINDOW_TOPLEFT set "KYTY_WINDOW_TOPLEFT=1"
 rem Speed defaults (2026-10-19, instructions 8.11 / 8.21): 1080p output and branch conditions
 rem that take both paths. Override before launching, e.g. KYTY_VIDEO_OUT_RES=2 (4K) or
 rem KYTY_SRT_BRANCH_BOTH=0. The GPU crash diag writes a report on device loss.
