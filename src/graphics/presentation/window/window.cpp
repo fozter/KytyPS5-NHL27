@@ -33,6 +33,13 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // KYTY_WINDOW_TOPLEFT
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
 #include "stb_image.h"
@@ -850,21 +857,28 @@ static void WindowCreate(WindowContext& context) {
 			SDL_free(displays);
 		}
 	}
-	// KYTY_WINDOW_TOPLEFT=1: the top-left corner of that display (or the primary one) instead of
-	// its centre; the position is the client area's, so the title bar is added back.
-	SDL_Rect bounds {};
-	if (std::getenv("KYTY_WINDOW_TOPLEFT") != nullptr &&
-	    SDL_GetDisplayBounds(window_display != 0 ? window_display : SDL_GetPrimaryDisplay(),
-	                         &bounds)) {
-		int top = 0, left = 0, bottom = 0, right = 0;
-		(void)SDL_GetWindowBordersSize(context.window, &top, &left, &bottom, &right);
-		SDL_SetWindowPosition(context.window, bounds.x + left, bounds.y + (top > 0 ? top : 31));
-	} else if (window_display != 0) {
+	if (window_display != 0) {
 		SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED_DISPLAY(window_display),
 		                      SDL_WINDOWPOS_CENTERED_DISPLAY(window_display));
 	} else {
 		SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	}
+#if defined(_WIN32)
+	// KYTY_WINDOW_TOPLEFT=1: then move the whole window (title bar included) to the top-left corner
+	// of the monitor it was centred on. Done with Win32 monitor coordinates: SDL's display bounds
+	// and window positions differ when the monitors use different scaling.
+	if (std::getenv("KYTY_WINDOW_TOPLEFT") != nullptr) {
+		auto* hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+		    SDL_GetWindowProperties(context.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+		MONITORINFO monitor {};
+		monitor.cbSize = sizeof(monitor);
+		if (hwnd != nullptr &&
+		    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+			SetWindowPos(hwnd, nullptr, monitor.rcMonitor.left, monitor.rcMonitor.top, 0, 0,
+			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+		}
+	}
+#endif
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
