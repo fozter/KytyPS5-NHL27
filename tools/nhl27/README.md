@@ -26,6 +26,4 @@ emulator checkout as `KytyPS5`).
 | `KYTY_FAULT_EMULATE=0/1` | Emulate GPU-thread loads from pages that only share a 4 KiB page with GPU-written data instead of draining the GPU (default 1). |
 | `KYTY_GPU_INDIRECT=1` | PR #1288's GPU path for GPU-written indirect draws (opt-in; with rect lists it is ~10% faster but showed hangs in a list-walking compute shader, under investigation). `KYTY_GPU_INDIRECT_RECTLIST=0`, `KYTY_GPU_INDIRECT_FLUSH=1` for isolation. |
 | `KYTY_LABEL_DEFER_ALL=1` | Publish every end-of-pipe label only after the GPU completed the work before it (experiment). |
-| `KYTY_FRAME_TRACE=<file>` | Frame pacing trace (see `frame_trace.py`). |
 | `KYTY_DIAG_SAMPLER=1/2/3`, `KYTY_DIAG_SAMPLER_OUT=<file>` | In-process sampling profiler (3 = all threads). |
-| `KYTY_WINDOW_DISPLAY=<n>/secondary`, `KYTY_WINDOW_TOPLEFT=1` | Window placement. |
