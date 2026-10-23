@@ -438,7 +438,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -450,7 +450,9 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	spvtools::ValidatorOptions validator_options;
+	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
+	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -580,7 +582,8 @@ struct PipelineCache::ProgramCache {
 		FrameBreakdown::Add(FrameBreakdown::g_counters.compile_count);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		                         options.maintenance8_enabled)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -599,7 +602,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		const auto module = CompileSPV(result.spirv, device);
+		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -614,7 +617,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	static std::pair<ShaderRecompiler::CompileOptions, const char*>
+	std::pair<ShaderRecompiler::CompileOptions, const char*>
 	MakeCompileOptions(ShaderType stage, const ShaderParams& params, InputInfo& input_info) {
 		const auto           user_data = std::span(params.user_data).first(params.user_data_count);
 		ShaderStageInputInfo stage_input {};
@@ -660,6 +663,7 @@ struct PipelineCache::ProgramCache {
 		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
+		options.maintenance8_enabled = graphics.maintenance8_enabled;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code   = params.back_code;
@@ -1246,7 +1250,7 @@ struct PipelineCache::ProgramCache {
 		std::printf("NHL27RESOURCE: experiments batch_reads=%d\n", batch_reads ? 1 : 0);
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
 		resource_timing = timing != nullptr && timing[0] == '1';
@@ -1264,7 +1268,7 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
 	}
@@ -1283,7 +1287,7 @@ struct PipelineCache::ProgramCache {
 	unsigned cache_control_capacity = 0;
 	std::array<uint64_t, static_cast<size_t>(ResourceMemo::Miss::Count)> resource_misses {};
 	std::chrono::steady_clock::time_point last_stats = std::chrono::steady_clock::now();
-	vk::Device                                                  device;
+	GraphicContext&                                             graphics;
     PipelineRecord::RecordFile* record = nullptr;
     const PipelineRecord::Program* replaying = nullptr;
     std::unordered_map<uint64_t, uint32_t> ordinals;
@@ -1448,7 +1452,7 @@ struct PipelineCache::ProgramCache {
 				       other.program.bindings.push_data_start_dword == layout.push_data_start_dword;
 			});
 			if (known) {
-				device.destroyShaderModule(permutation->handle.module, nullptr);
+				graphics.device.destroyShaderModule(permutation->handle.module, nullptr);
 			} else {
 				if (store != nullptr && !job.stored) {
 					stored_specialization = permutation->specialization;
@@ -1621,7 +1625,7 @@ struct PipelineCache::ProgramCache {
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// LoadStore takes the program lock, so it must be set before the store is read.
 	m_program_cache->program_lock = &m_program_lock;

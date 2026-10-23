@@ -1299,6 +1299,142 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+void TestRebasedTextureMipViews() {
+  constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
+  constexpr auto tile = Prospero::TileMode::kStandard4KB;
+  TileSizeAlign allocation{};
+  TileGetTextureSize(format, 16, 16, 1, tile, &allocation, nullptr, nullptr);
+  Check(allocation.size == 0x1000 && allocation.align == 0x1000,
+        "rebased texture views changed guest allocation size/alignment");
+
+  ImageInfo chain{};
+  chain.data.address = 0x5032b23000;
+  chain.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+  chain.guest_format = format;
+  chain.extent = {256, 256, 1};
+  chain.resources = {9, 2};
+  chain.tile_mode = tile;
+  chain.UpdateSize();
+  Check(chain.tiled_slice_stride == 0xab000 && chain.data.size == 0x156000 &&
+            chain.first_tail_level == 4 && chain.DataAlignment() == 0x1000,
+        "full texture chain lost its guest allocation layout");
+  const std::array<uint64_t, 9> offsets{
+      0x2b000, 0xb000, 0x3000, 0x1000, 0x800, 0x600, 0x500, 0x400, 0x300};
+  const auto make_view = [&](uint32_t level, uint32_t layer) {
+    auto view = chain;
+    view.data = {chain.data.address + layer * chain.tiled_slice_stride +
+                     offsets[level], 0};
+    view.extent = {256u >> level, 256u >> level, 1};
+    view.resources = {1, 1};
+    view.pitch = 0;
+    view.UpdateSize();
+    return view;
+  };
+  for (uint32_t layer = 0; layer < 2; ++layer) {
+    for (uint32_t level = 0; level < offsets.size(); ++level) {
+      auto view = make_view(level, layer);
+      const uint64_t bytes = uint64_t{view.extent.width} * view.extent.height * 8;
+      Check(view.data.size == bytes && view.mip_layout[0].size == bytes &&
+                view.tiled_slice_stride == std::max<uint64_t>(0x1000, bytes) &&
+                view.DataAlignment() == std::min<uint64_t>(0x1000,
+                                               std::max<uint64_t>(0x100, bytes)) &&
+                view.MipOf(chain) == static_cast<int32_t>(level) &&
+                view.SliceOf(chain, static_cast<int32_t>(level)) ==
+                    static_cast<int32_t>(layer),
+            "rebased mip footprint/origin or parent layer stride was incorrect");
+      view.UpdateSize();
+      Check(view.data.size == bytes && view.mip_layout[0].size == bytes &&
+                view.MipOf(chain) == static_cast<int32_t>(level),
+            "resizing a normalized view lost its compact footprint");
+    }
+  }
+  auto view = make_view(4, 0);
+  Check(view.data.address == 0x5032b23800 && view.mip_layout[0].pitch == 32 &&
+            view.mip_layout[0].height == 16 &&
+            view.mip_layout[0].linear_pitch == 32 && view.LinearSize() == 0x1000,
+        "captured 16x16 view changed its padded tiling or linear transfer size");
+  view.data.address += 0x800;
+  Check(view.MipOf(chain) == -1, "tail view accepted the following mip's address");
+  view = make_view(4, 0);
+  view.mip_layout[0].pitch /= 2;
+  Check(view.MipOf(chain) == -1, "tail view accepted a different padded pitch");
+  view = make_view(4, 0);
+  view.resources.layers = 2;
+  view.data.size *= 2;
+  view.mip_layout[0].size *= 2;
+  Check(view.MipOf(chain) == -1, "tail array view ignored the parent chain stride");
+  view = make_view(4, 0);
+  view.data = {chain.data.address, 0x1000};
+  view.UpdateSize();
+  Check(view.MipOf(chain) == -1,
+        "full-block child ignored the parent mip's nonzero tail origin");
+
+  for (uint32_t variant = 0; variant < 9; ++variant) {
+    view = make_view(4, 0);
+    view.data = {chain.data.address, 0};
+    view.pitch = 0;
+    switch (variant) {
+    case 0: view.extent = {7, 16, 1}; break; // Unproven non-power-of-two view.
+    case 1: view.resources.levels = 2; break;
+    case 2: view.resources.layers = 2; break;
+    case 3: view.type = Prospero::ImageType::kColor3D; break;
+    case 4: view.tile_mode = Prospero::TileMode::kStandard64KB; break;
+    case 5: view.metadata.kind = ImageMetadataKind::Dcc; break;
+    case 6: view.data = {0x5032b23800, 0x1000}; break;
+    case 7:
+    case 8:
+      view.guest_format = variant == 7 ? Prospero::BufferFormat::k8UNorm
+                                       : Prospero::BufferFormat::k16UNorm;
+      view.pixel_format = variant == 7 ? vk::Format::eR8Unorm : vk::Format::eR16Unorm;
+      view.bytes_per_block = 0;
+      view.extent = {1, 1, 1};
+      break;
+    }
+    view.UpdateSize();
+    Check(view.data.size >= 0x1000 && view.DataAlignment() >= 0x1000,
+          "unsupported or explicitly sized texture became a compact tail view");
+  }
+  view = make_view(4, 0);
+  view.data = {0x5032b23900, 0};
+  view.UpdateSize();
+  Check(view.data.size == 0x1000 && view.DataAlignment() == 0x1000,
+        "misaligned descriptor received compact tail alignment");
+
+  view = make_view(4, 0);
+  view.data = {chain.data.address, 0};
+  view.extent.width = 8;
+  view.UpdateSize();
+  Check(view.data.size == 0x600 && view.DataAlignment() == 0x800,
+        "sparse rectangle confused addressed span with active byte count");
+
+  auto sparse_chain = chain;
+  sparse_chain.data = {0x503225f000, 0};
+  sparse_chain.pixel_format = vk::Format::eR32G32B32A32Uint;
+  sparse_chain.guest_format = Prospero::BufferFormat::k32_32_32_32UInt;
+  sparse_chain.extent = {64, 64, 1};
+  sparse_chain.resources = {6, 7};
+  sparse_chain.pitch = sparse_chain.bytes_per_block = 0;
+  sparse_chain.UpdateSize();
+  auto sparse = sparse_chain;
+  sparse.data = {0x50322e3500, 0};
+  sparse.extent = {2, 2, 1};
+  sparse.resources = {1, 1};
+  sparse.pitch = 0;
+  sparse.UpdateSize();
+  Check(sparse_chain.tiled_slice_stride == 0x16000 &&
+            sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
+            sparse.DataAlignment() == 0x100 && sparse.LinearSize() == 0x200 &&
+            sparse.MipOf(sparse_chain) == 5 && sparse.SliceOf(sparse_chain, 5) == 6,
+        "captured sparse 2x2 view lost its byte span, tail origin, or array layer");
+  sparse.UpdateSize();
+  Check(sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
+            sparse.DataAlignment() == 0x100,
+        "repeated sparse view sizing changed its span or alignment");
+  sparse.data.address -= 0x100;
+  Check(sparse.MipOf(sparse_chain) == -1,
+        "sparse view accepted a different mip-tail origin");
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -4708,6 +4844,26 @@ void TestNewShaderDecoderArchitecture() {
             byte_left_shift.src1.value == 1u,
         "decoder rejected or misdecoded captured V_LSHLREV_B32 byte shift");
 
+  const uint32_t vop2_sdwa_byte_left_destination[] = {
+      0x340a08f9u, 0x01861187u, // v_lshlrev_b32 v5.byte1, 7, v4.byte1; preserve
+  };
+  Instruction byte_left_destination;
+  ShaderRecompiler::Decoder::DecodeInstruction(vop2_sdwa_byte_left_destination, 0u,
+                                               byte_left_destination);
+  Check(byte_left_destination.family == Family::VOP2 &&
+            byte_left_destination.opcode == Opcode::V_LSHLREV_B32 &&
+            byte_left_destination.word_count == 2u &&
+            byte_left_destination.dst.reg == 5u &&
+            byte_left_destination.dst.sdwa_sel == 1u &&
+            byte_left_destination.dst.sdwa_dst_unused == 2u &&
+            byte_left_destination.dst.explicit_sdwa_dst &&
+            byte_left_destination.src0.kind == OperandKind::IntegerInlineConstant &&
+            byte_left_destination.src0.value == 7u &&
+            byte_left_destination.src0.sdwa_sel == 6u &&
+            byte_left_destination.src1.kind == OperandKind::Vgpr &&
+            byte_left_destination.src1.reg == 4u && byte_left_destination.src1.sdwa_sel == 1u,
+        "decoder rejected or misdecoded captured V_LSHLREV_B32 byte destination");
+
   const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
                                EncodeMimg1(4, 0, 1, 8), 0x03020100u,
                                0x07060504u, 0x0b0a0908u};
@@ -7914,6 +8070,29 @@ void TestNewShaderRecompilerDsAddtidTranslation() {
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestDsReturningAtomic64Decoder() {
+  using namespace ShaderRecompiler::Decoder;
+  // CS23e96bf5029f62fd: native DATA is the comparison and DATA2 the replacement.
+  const uint32_t max_words[] = {0xd9a00008u, 0x00000400u};
+  const uint32_t cmp_words[] = {0xd9c00010u, 0x0202003fu};
+  Instruction decoded;
+  DecodeInstruction(max_words, 0u, decoded);
+  Check(decoded.opcode == Opcode::DS_MAX_RTN_U64 &&
+            decoded.word_count == 2u && decoded.data_dwords == 2u &&
+            decoded.data_bits == 32u && decoded.src_count == 2u &&
+            decoded.src0.reg == 0u && decoded.src1.reg == 4u &&
+            decoded.dst.reg == 0u && decoded.offset == 8u && !decoded.gds,
+        "captured DS_MAX_RTN_U64 lost its QWORD width, byte offset, or aliases");
+  DecodeInstruction(cmp_words, 0u, decoded);
+  Check(decoded.opcode == Opcode::DS_CMPST_RTN_B64 &&
+            decoded.word_count == 2u && decoded.data_dwords == 2u &&
+            decoded.data_bits == 32u && decoded.src_count == 3u &&
+            decoded.src0.reg == 63u && decoded.src1.reg == 0u &&
+            decoded.src2.reg == 2u && decoded.dst.reg == 2u &&
+            decoded.offset == 16u && !decoded.gds,
+        "captured DS_CMPST_RTN_B64 lost its comparison/replacement pairs or aliases");
 }
 
 void TestDsFloatMinMaxDecoder() {
@@ -12541,7 +12720,7 @@ void TestValuePhiValidation() {
 #endif
 }
 
-void TestWave32MaskProjection() {
+void TestLaneMaskProjection() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t wave_size : {32u, 64u}) {
     Program program;
@@ -12580,6 +12759,19 @@ void TestWave32MaskProjection() {
           : U32(Value(3u));
       return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), U32(Value(1u))), zero);
     };
+    const auto low_half = e.ULessThan(U32(e.Emit(ValueOpcode::LaneId)), U32(Value(32u)));
+    const auto mask_bit = [&](uint32_t low, uint32_t high) {
+      const auto word = wave_size == 64u ? e.Select(low_half, U32(Value(low)), U32(Value(high)))
+                                        : U32(Value(low));
+      return thread_bit(e, word);
+    };
+    const auto full = mask_bit(UINT32_MAX, UINT32_MAX);
+    const auto empty = mask_bit(0u, 0u);
+    const auto low_only = mask_bit(UINT32_MAX, 0u);
+    const auto high_only = mask_bit(0u, UINT32_MAX);
+    const auto partial = mask_bit(0x80000000u, 0x80000000u);
+    const auto full_write = e.Select(full, U32(Value(42u)), raw);
+    const auto empty_write = e.Select(empty, U32(Value(42u)), raw);
     const auto active_mask = ballot(e, active);
     const auto direct = thread_bit(e, active_mask);
     const auto arbitrary = thread_bit(e, raw);
@@ -12622,7 +12814,14 @@ void TestWave32MaskProjection() {
     program.blocks[1]->condition = remaining_predicate;
 
     ConstantPropagationPass(program.blocks, wave_size);
+    Check(full.Resolve() == Value(true) && empty.Resolve() == Value(false) &&
+              full_write.Resolve() == Value(42u) && empty_write.Resolve() == raw.Resolve(),
+          "constant EXEC mask retained lane extraction or register predication");
+    Check(partial.Resolve().TryInstruction() != nullptr,
+          "partial mask was incorrectly folded to a constant predicate");
     if (wave_size == 32u) {
+      Check(low_only.Resolve() == Value(true) && high_only.Resolve() == Value(false),
+            "wave32 constant mask incorrectly consumed the high half");
       Check(direct.Resolve() == active.Resolve(), "wave32 ballot round trip lost its predicate");
       Check(EquivalentValue(program, combined, combined_predicate),
             "wave32 OR mask projection changed a lane predicate");
@@ -12642,6 +12841,9 @@ void TestWave32MaskProjection() {
                 projected->PhiBlock(1) == loop,
             "mask projection lost loop Phi type or predecessor order");
     } else {
+      Check(low_only.Resolve().TryInstruction() != nullptr &&
+                high_only.Resolve().TryInstruction() != nullptr,
+            "wave64 mixed halves were incorrectly folded to a constant predicate");
       Check(direct.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
                 live.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
                 combined.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
@@ -12660,6 +12862,86 @@ void TestWave32MaskProjection() {
     RemoveIdentities(program.blocks);
     ValidateProgram(program, true);
   }
+}
+
+void TestLateConstantPropagation() {
+  using namespace ShaderRecompiler::IR;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    for (const bool reverse : {false, true}) {
+      Program program;
+      program.stage = ShaderType::Compute;
+      program.wave_size = wave_size;
+      for (uint32_t id = 0; id < 4; ++id) {
+        program.block_storage.push_back(std::make_unique<Block>());
+        program.blocks.push_back(program.block_storage.back().get());
+        program.blocks.back()->id = id;
+      }
+      auto *entry = program.blocks[0];
+      auto *header = program.blocks[1];
+      auto *latch = program.blocks[2];
+      auto *exit = program.blocks[3];
+      entry->AddBranch(header);
+      header->AddBranch(latch);
+      header->AddBranch(exit);
+      latch->AddBranch(header);
+      entry->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+      entry->terminator.true_block = header;
+      header->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+      header->terminator.true_block = latch;
+      header->terminator.false_block = exit;
+      latch->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+      latch->terminator.true_block = header;
+      IREmitter e(entry);
+      const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+      const auto active = e.INotEqual(raw, U32(Value(0u)));
+      header->condition = active;
+      auto &predicate = header->AppendNewInst(ValueOpcode::Phi);
+      predicate.SetFlags(Type::U1);
+      auto &mask = header->AppendNewInst(ValueOpcode::Phi);
+      mask.SetFlags(Type::U32);
+      const auto thread_bit = [](IREmitter &ir, U32 word) {
+        const auto lane = ir.BitwiseAnd(U32(ir.Emit(ValueOpcode::LaneId)), U32(Value(31u)));
+        return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, lane), U32(Value(1u))),
+                           U32(Value(0u)));
+      };
+      IREmitter body(header);
+      const auto live = thread_bit(body, U32(Value(&mask)));
+      const auto selected = body.Select(live, U32(Value(42u)), raw);
+      const auto projected = body.Emit(ValueOpcode::SelectU1,
+                                      {Value(&predicate), live, Value(false)});
+      const auto absorbed = body.LogicalAnd(active,
+          body.LogicalOr(body.LogicalNot(active), U1(Value(&predicate))));
+      IREmitter tail(latch);
+      const auto full = thread_bit(tail, U32(Value(UINT32_MAX)));
+      const auto full_word = tail.Select(full, U32(Value(UINT32_MAX)), U32(Value(0u)));
+      predicate.AddPhiOperand(entry, Value(true));
+      predicate.AddPhiOperand(latch, full);
+      mask.AddPhiOperand(entry, Value(UINT32_MAX));
+      mask.AddPhiOperand(latch, full_word);
+      exit->condition = projected;
+      if (reverse) std::ranges::reverse(program.blocks);
+
+      ConstantPropagationPass(program.blocks, wave_size);
+      if (reverse) std::ranges::reverse(program.blocks);
+      Check(Value(&predicate).Resolve() == Value(true) &&
+                Value(&mask).Resolve() == Value(UINT32_MAX) && live.Resolve() == Value(true) &&
+                selected.Resolve() == Value(42u) && projected.Resolve() == Value(true) &&
+                absorbed.Resolve() == active.Resolve(),
+            "late constants did not reach Phi, nested mask patterns or new logical nodes");
+      ResolveControlFlowIdentities(program);
+      Check(exit->condition == Value(true), "late constant lost its control-flow use");
+      RemoveIdentities(program.blocks);
+      ValidateProgram(program, true);
+    }
+  }
+
+  Block cycle;
+  auto &phi = cycle.AppendNewInst(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  phi.AddPhiOperand(&cycle, Value(&phi));
+  ConstantPropagationPass({&cycle});
+  Check(phi.GetOpcode() == ValueOpcode::Phi && phi.Arg(0).TryInstruction() == &phi,
+        "an ungrounded Phi cycle acquired a constant");
 }
 
 void TestU64ShiftConstantPropagation() {
@@ -13722,7 +14004,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
   const uint32_t shader[] = {
-      EncodeSmem0(0x08, 0, 4),
+      EncodeSmem0(0x08, 0, 16),
       0u, // s_buffer_load_dword s0
       EncodeVop1(0x01, 0, 0),
       EncodeMubuf0(0x1c, 8),
@@ -13740,6 +14022,13 @@ void TestNewShaderRecompilerNativeBindingPlan() {
 
   auto user_data = ImageTestUserData();
   SetImageTestFormat(&user_data, 6, Prospero::BufferFormat::k32UInt);
+  // Buffers have their own nonempty V# descriptors, disjoint from the T#/S# data.
+  for (const auto start : {4u, 32u}) {
+    user_data[start] = 0x1000u + start * 0x100u;
+    user_data[start + 1u] = 4u << 16u;
+    user_data[start + 2u] = 0x1000u;
+    user_data[start + 3u] = 3u << 28u;
+  }
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data;
@@ -14383,8 +14672,15 @@ void TestBoundedScalarMaterialImageKeys() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.keys == 0,
         "scalar material byte range escaped V# bounds");
   memory = {.mixed = true};
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "selected material fields bypassed image compatibility");
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 4 && specialization.images.size() == 4,
+        "selected material fields rejected mixed native numeric classes");
+  for (uint32_t i = 0; i < snapshot.images.size(); ++i) {
+    Check(specialization.images[i].numeric_class ==
+              (snapshot.images[i].dwords[0] == 5588u
+                  ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float),
+          "selected material fields lost a candidate's native numeric class");
+  }
   memory = {};
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "native scalar material image selection did not recover after rejected candidates");
@@ -14619,7 +14915,8 @@ void TestSrtWalkerRealSBufferTranslation() {
 
   user_data[10] = 3 * sizeof(uint32_t);
   const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(plan, runtime).RefreshFlatBuffer(flat);
-  Check(!bounds_walked, "real S_BUFFER_LOAD walk ignored descriptor bounds");
+  Check(bounds_walked && flat == std::vector<uint32_t>{table[0], table[1], table[2], 0u},
+        "real S_BUFFER_LOAD walk did not zero only the out-of-bounds DWORD");
   CheckFlattenedReadSlots(
       ir, 4, "real S_BUFFER_LOAD patch used the wrong flat offsets");
 
@@ -15895,6 +16192,7 @@ int main(int argc, char **argv) {
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
+  TestRebasedTextureMipViews();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
@@ -15929,6 +16227,7 @@ int main(int argc, char **argv) {
   // here.
   TestScalarAshrI64Decoder();
   TestImageAtomicWidthDecoder();
+  TestDsReturningAtomic64Decoder();
   TestDsFloatMinMaxDecoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
@@ -16023,7 +16322,8 @@ int main(int argc, char **argv) {
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
   TestValuePhiValidation();
-  TestWave32MaskProjection();
+  TestLaneMaskProjection();
+  TestLateConstantPropagation();
   TestU64ShiftConstantPropagation();
   TestU64RegisterPairRoundTrip();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS

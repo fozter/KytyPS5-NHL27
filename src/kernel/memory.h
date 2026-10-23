@@ -112,6 +112,7 @@ void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 // Crash diagnostics: a ring of recent host (emulated GPU / command processor) writes into guest
 // memory. ReportHostWrites prints the logged writes that overlap [vaddr - window, vaddr + window).
@@ -180,6 +181,7 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 // Changes whenever backing is mapped or unmapped, or a PRT aperture changes: an unchanged value
 // means IsBackingReadable still answers as before.
 [[nodiscard]] uint64_t BackingEpoch() noexcept;
+bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // As ClampRangeSize, but 0 (instead of a fatal error) when no byte of the range is mapped.
 [[nodiscard]] uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size);
@@ -258,6 +260,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();

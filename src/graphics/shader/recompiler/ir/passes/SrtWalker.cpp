@@ -552,8 +552,9 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
-	    : m_program(program), m_type(type) {}
+	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
+	                          bool wave_uniform = false)
+	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -661,6 +662,12 @@ private:
 			}
 			return finish(true);
 		}
+		if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
+			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+			return finish(m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
+			              inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
+			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
+		}
 		if (op == ValueOpcode::Phi) {
 			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
 				return finish(false);
@@ -740,6 +747,7 @@ private:
 
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
+	bool                            m_wave_uniform;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
@@ -5262,6 +5270,10 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
+}
+
+bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
+	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
 }
 
 

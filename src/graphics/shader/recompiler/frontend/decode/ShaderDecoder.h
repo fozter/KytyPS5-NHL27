@@ -547,6 +547,7 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
 	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_XYZW,
 	BUFFER_STORE_FORMAT_X,
 	BUFFER_STORE_FORMAT_XY,
 	BUFFER_STORE_FORMAT_XYZ,
@@ -563,6 +564,7 @@ enum class Opcode {
 	BUFFER_LOAD_DWORDX3,
 	BUFFER_LOAD_DWORDX4,
 	BUFFER_STORE_BYTE,
+	BUFFER_STORE_BYTE_D16_HI,
 	BUFFER_STORE_SHORT,
 	BUFFER_STORE_DWORD,
 	BUFFER_STORE_DWORDX2,
@@ -624,6 +626,8 @@ enum class Opcode {
 	DS_MIN_RTN_U32,
 	DS_MAX_U32,
 	DS_MAX_RTN_U32,
+	DS_MAX_RTN_U64,
+	DS_CMPST_RTN_B64,
 	DS_AND_B32,
 	DS_AND_RTN_B32,
 	DS_OR_B32,
@@ -762,6 +766,7 @@ enum ImageSampleFlag : uint32_t {
 	ImageSampleFlagCd               = 1u << 8u,
 	ImageSampleFlagGatherHorizontal = 1u << 9u,
 	ImageSampleFlagAdjust           = 1u << 10u,
+	ImageSampleFlagUnnormalized     = 1u << 11u,
 };
 
 enum class ImageDimension : uint32_t {

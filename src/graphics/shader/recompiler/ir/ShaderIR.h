@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Xbyak {
@@ -26,6 +27,11 @@ class CodeGenerator;
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+class SrtWalker;
+
+// Finite descriptor domains also bound the arithmetic used to prove their indices.
+constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 
 enum class ResourceKind {
 	None,
@@ -77,7 +83,10 @@ struct MemoryInfo {
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		return !typed && data_bits == 32u &&
+		if (typed) return false;
+		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
+		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
+		return data_bits == 32u &&
 		       (formatted ? opcode == ValueOpcode::LoadBufferU32
 		                  : opcode == ValueOpcode::ReadConstBuffer ||
 		                        opcode == ValueOpcode::LoadBufferU32 ||
@@ -185,11 +194,27 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+[[nodiscard]] constexpr Prospero::BufferFormat
+RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
+	if (image.resource_class != ImageResourceClass::Storage || !image.written)
+		return Prospero::BufferFormat::kInvalid;
+	if (format == Prospero::BufferFormat::k32SInt && (image.atomic ? !image.atomic64 : !image.read))
+		return Prospero::BufferFormat::k32UInt;
+	if (format == Prospero::BufferFormat::k16SInt && !image.read && !image.atomic)
+		return Prospero::BufferFormat::k16UInt;
+	return Prospero::BufferFormat::kInvalid;
+}
+
 struct SamplerResource {
+	static constexpr uint32_t NoIndirectSampler = UINT32_MAX;
+
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
 	// Native filtering/border variants share the original sampler's runtime descriptor.
 	uint32_t snapshot_index        = 0;
+	uint32_t indirect_root = NoIndirectSampler;
+	uint32_t indirect_mapping_offset = 0;
+	uint32_t indirect_search_iterations = 0;
 	std::vector<uint32_t> indirect_resources;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
@@ -575,25 +600,44 @@ struct ShaderInfo {
 struct DescriptorSource {
 	struct IndirectDescriptor {
 		struct SelectorRead {
+			struct CountedRows {
+				uint32_t source = UINT32_MAX;
+				uint32_t stride = 0; // Byte spacing between selector rows, not their length.
+
+				bool operator==(const CountedRows& other) const = default;
+			};
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
+			uint32_t maximum = UINT32_MAX;
+			uint32_t bit_offset = 0;
+			uint32_t bit_mask = UINT32_MAX;
+			bool global = false;
+			// Four DWORD bitmap words per record; set-bit ranks subtract from the last key.
+			bool bitset = false;
+			std::optional<CountedRows> rows;
+			std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
 		std::optional<SelectorRead> selector;
+		std::optional<uint32_t> table_maximum;
+		std::optional<uint32_t> pointer_offset;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
 		uint32_t table_stride    = 0;
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
+		bool     indexed = false;
+		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		// The table entry is at ((key * table_stride) & table_mask) + table_offset.
 		uint32_t table_mask      = UINT32_MAX;
 		// A bindless T# table: every table entry is a candidate.
 		bool     table_array     = false;
 		Value    key_count;
+		// First selector index, or first descriptor key for a direct or bitmap range.
 		Value                 selector_first;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;
@@ -695,6 +739,7 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<DescriptorGather>       descriptor_gathers;
 	std::vector<ResourceBlock>          control_flow;
+	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	// Contiguous scalar reads eligible for one backing read, indexed by first slot.
 	std::vector<uint32_t>               srt_batch_counts;
@@ -710,10 +755,11 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
 	mutable uint32_t                       evaluation_depth       = 0;
+	mutable uint32_t                       evaluation_value_count = 0;
 	mutable std::vector<uint8_t>            active_sources;
 	mutable std::vector<uint8_t>            visited_blocks;
+	mutable std::vector<uint8_t>            reachable_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	// Dense evaluation index of each srt_reads[slot].value, filled on first batched refresh.

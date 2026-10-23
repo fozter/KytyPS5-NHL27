@@ -32,10 +32,8 @@ struct ImageLookupState {
 	bool     cpu_dirty       = false;
 	bool     buffer_modified = false;
 	bool     gpu_modified    = false;
-	bool     texture         = false;
 	bool     storage         = false;
 	bool     render_target   = false;
-	bool     depth_target    = false;
 
 	bool operator==(const ImageLookupState&) const = default;
 
@@ -47,10 +45,8 @@ struct ImageLookupState {
 		        .cpu_dirty       = image.IsCpuDirty(),
 		        .buffer_modified = image.IsBufferModified(),
 		        .gpu_modified    = image.IsGpuModified(),
-		        .texture         = image.usage.texture,
 		        .storage         = image.usage.storage,
-		        .render_target   = image.usage.render_target,
-		        .depth_target    = image.usage.depth_target};
+		        .render_target   = image.usage.render_target};
 	}
 };
 

@@ -378,9 +378,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
-	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
-	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+	const bool raw_sint_storage = uint_resource &&
+	    ShaderRecompiler::IR::RawSignedStorageFormat(resource, format) != Prospero::BufferFormat::kInvalid;
+	const auto numeric_class =
+	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;
 	const bool format_ok =
@@ -630,7 +631,8 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
-	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
+	    storage || resource.numeric_class ==
+	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
@@ -649,10 +651,11 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
+	const auto raw_sint_format = ShaderRecompiler::IR::RawSignedStorageFormat(resource, format);
 	const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
-	                                 : storage && (resource.atomic ||
-	                                               format == Prospero::BufferFormat::k32SInt)
-	                                     ? vk::Format::eR32Uint
+	                                 : storage && resource.atomic ? vk::Format::eR32Uint
+	                                 : raw_sint_format != Prospero::BufferFormat::kInvalid
+	                                     ? VulkanFormat(raw_sint_format)
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
@@ -669,6 +672,9 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
+	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+		desc.info.metadata.kind = ImageMetadataKind::Dcc;
+	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
@@ -681,8 +687,7 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	} else {
 		desc.info.UpdateSize();
 	}
-	const auto alignment =
-	    tile == Prospero::TileMode::kLinear ? 256u : desc.info.tiling.block.block_size;
+	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
 	if (storage) {
@@ -693,7 +698,6 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
 		                     std::countr_zero(samples));
-		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
 	}
@@ -1401,7 +1405,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
-		image.usage.texture |= !storage;
 		if (binding.lookup != nullptr && !binding.reused) {
 			auto& found           = binding.lookup->found;
 			found.id              = binding.image_id;
@@ -1428,7 +1431,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			BindImage(texture.image_id, false);
 		}
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
-		texture_cache.GetImage(texture.image_id).usage.texture = true;
 	}
 }
 
