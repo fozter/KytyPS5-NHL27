@@ -652,7 +652,16 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
+	// Tiny GPU-written images (at most 64 texels) are read back too, tiled or not (KytyPS5 PR #1753):
+	// games read results such as exposure from them on the CPU. NHL 27 enrolls dozens of 1x1 and
+	// 2x2 tiled targets of this kind.
+	constexpr uint64_t kMaxTinyReadbackTexels = 64;
+	const auto&        extent = image.info.extent;
+	const bool         tiny   = image.info.IsTiled() && !image.depth_id &&
+	                  image.info.resources.layers == 1 && image.info.resources.levels == 1 &&
+	                  uint64_t {extent.width} * extent.height * extent.depth <= kMaxTinyReadbackTexels &&
+	                  image.IsGpuModified() && CanDownload(image);
+	if (m_readback_linear_images && (tiny || !image.info.IsTiled()) && !image.info.data.Empty()) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
