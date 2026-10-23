@@ -15,7 +15,9 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/diagSampler.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameTrace.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -347,7 +349,9 @@ void GuestGpu::SuspendPoint() {
 	// finish the preceding graphics frame. The first point returns immediately.
 	Common::Timeline::Mark("suspend-wait");
 	Common::EventTrace::Record(Common::EventTrace::SUSPEND_ACQ_BEGIN);
+	FrameTrace('P', 0);
 	m_suspend_point_ready->acquire();
+	FrameTrace('A', 0);
 	Common::EventTrace::Record(Common::EventTrace::SUSPEND_ACQ_END);
 	Common::Timeline::Mark("suspend-go");
 	Submission submission;
@@ -1550,6 +1554,11 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	FrameTrace(submission.type == SubmissionType::Graphics         ? 'G'
+	           : submission.type == SubmissionType::Compute         ? 'C'
+	           : submission.type == SubmissionType::FlipPreparation ? 'F'
+	                                                                : 'S',
+	           submission.commands.size());
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_epoch.fetch_add(1, std::memory_order_release);
@@ -1627,6 +1636,11 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	// KYTY_DIAG_SAMPLER (fozter/KytyPS5-NHL27): mode 2 samples this thread from here on, mode 3
+	// every thread of the process.
+	{
+		DiagSampler::Scope start_diag_sampler;
+	}
 	g_gpu_thread = !gpu->m_pipelined;
 	g_cp_thread  = gpu->m_pipelined;
 	RegionManager::MarkGpuOrderedThread();
@@ -1830,7 +1844,9 @@ void GuestGpu::ThreadRun(void* data) {
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, kind, gpu->m_submit_id);
 			QueueTimeScope queue_time(submission.queue_id);
 			g_current_queue = submission.queue_id;
+			FrameTrace('b', static_cast<uint64_t>(submission.type));
 			complete = gpu->Process(submission);
+			FrameTrace('e', complete ? 1u : 0u);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, kind | (complete ? 0u : 0x100u),
 			                           gpu->m_submit_id);
 		}
@@ -2165,6 +2181,7 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
 				m_renderer.GetCommandScheduler().DeferHostOperation([ready] {
 					Common::EventTrace::Record(Common::EventTrace::SUSPEND_RELEASE);
+					FrameTrace('R', 0);
 					ready->release();
 				}, true);
 			});
@@ -3418,6 +3435,7 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 
 void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
+	FrameTrace('q', interrupt_context_id);
 	// KYTY_DIRECT_EOP_INTERRUPTS: end-of-pipe labels are already written when the CP reaches them
 	// and recorded work holds its own copies of guest memory, so deliver the interrupt with the
 	// label instead of after host completion. CPU reads of GPU-written memory still wait for the
