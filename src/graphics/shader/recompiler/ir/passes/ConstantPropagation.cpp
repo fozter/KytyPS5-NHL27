@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -53,16 +54,24 @@ public:
 	void QueueUsers(const std::vector<Use>& users) {
 		++generation;
 		affected.clear();
-		for (const auto& use: users) affected.push_back(use.user);
+		for (const auto& use: users) affected.push_back({use.user, 1u});
 		// Pattern folds inspect nested operands even when intermediate operations
 		// stay dynamic. Visit consumers once per change, including cyclic Phi edges.
+		// KYTY_CONSTPROP_USER_DEPTH=N stops at the N-th level of users (default: all of them, which
+		// costs a walk over every transitive user per change, ~95% of shader compile time).
+		static const uint32_t max_depth = [] {
+			const char* value = std::getenv("KYTY_CONSTPROP_USER_DEPTH");
+			const auto  depth = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+			return depth != 0 ? static_cast<uint32_t>(depth) : UINT32_MAX;
+		}();
 		for (size_t i = 0; i < affected.size(); ++i) {
-			auto* inst = affected[i];
+			const auto [inst, depth] = affected[i];
 			const auto found = locations.find(inst);
 			if (found == locations.end() || found->second.visited == generation) continue;
 			found->second.visited = generation;
 			Queue(inst);
-			for (const auto& use: inst->Uses()) affected.push_back(use.user);
+			if (depth >= max_depth) continue;
+			for (const auto& use: inst->Uses()) affected.push_back({use.user, depth + 1u});
 		}
 	}
 
@@ -78,7 +87,7 @@ public:
 	std::unordered_set<Inst*> lowered_ancillary;
 
 private:
-	std::vector<Inst*> affected;
+	std::vector<std::pair<Inst*, uint32_t>> affected; // user and its distance from the change
 	uint64_t generation = 0;
 };
 

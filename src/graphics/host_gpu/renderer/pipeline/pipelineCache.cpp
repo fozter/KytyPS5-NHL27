@@ -593,6 +593,20 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		// KYTY_SPIRV_HASH_LOG=<file>: one "<shader hash> <SPIR-V hash> <words>" line per compiled
+		// permutation, to check that a recompiler change leaves the generated code identical.
+		static const char* const spirv_hash_log = std::getenv("KYTY_SPIRV_HASH_LOG");
+		if (spirv_hash_log != nullptr) {
+			static std::mutex mutex;
+			const auto        spirv_hash =
+			    XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+			std::lock_guard lock(mutex);
+			if (auto* file = std::fopen(spirv_hash_log, "a"); file != nullptr) {
+				std::fprintf(file, "%016" PRIx64 " %016" PRIx64 " %zu\n", options.shader_hash,
+				             spirv_hash, result.spirv.size());
+				std::fclose(file);
+			}
+		}
 		// KYTY_DBG_DUMP_SHADERS: the guest disassembly and the IR next to the SPIR-V.
 		if (ForceDumpShader(options.shader_hash) && !result.decoded_dump.empty()) {
 			static std::atomic_int text_id = 0;
