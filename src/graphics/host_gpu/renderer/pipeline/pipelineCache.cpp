@@ -1061,7 +1061,9 @@ struct PipelineCache::ProgramCache {
 		}
 
         PipelineRecord::Program recorded;
+        // Programs the warm-up record already holds are not appended again (record_keys).
         bool recording = record != nullptr && record->IsOpen() && replaying == nullptr &&
+                         !record_keys.contains(lookup_key) &&
                          PipelineRecord::IsRecordableStage(stage) &&
                          !entry->call_source;
         if (recording) {
@@ -1521,7 +1523,8 @@ struct PipelineCache::ProgramCache {
 	void Store(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
 	           uint32_t                                            push_data_cursor,
 	           const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
-		if (store == nullptr || replaying != nullptr) {
+		// A program loaded from the store is not stored again (store_keys).
+		if (store == nullptr || replaying != nullptr || store_keys.contains(key)) {
 			return;
 		}
 		StoredProgram program;
@@ -1616,6 +1619,7 @@ struct PipelineCache::ProgramCache {
 			job->push_data_cursor       = program.push_data_cursor;
 			job->specialization         = std::move(program.specialization);
 			job->stored                 = true;
+			store_keys.insert(job->key);
 			LockPrograms();
 			in_flight[job->key]++;
 			UnlockPrograms();
@@ -1632,6 +1636,11 @@ struct PipelineCache::ProgramCache {
 
 	// Warm-up records of earlier sessions, replayed on the workers (QueueRecords).
 	PipelineRecord::Records replay_records;
+	// Keys loaded from the store and the record at startup (read-only afterwards): a program
+	// compiled again because its job was taken back (WaitForCompile) is not stored or recorded a
+	// second time, so neither file grows with duplicates every boot.
+	std::unordered_set<ProgramKey, ProgramKeyHash> store_keys;
+	std::unordered_set<ProgramKey, ProgramKeyHash> record_keys;
 
 	// Background warm-up: the recorded programs compile on the workers with their recorded guest
 	// reads, so the window opens without waiting ~2.5 min for them; a draw that needs one first
@@ -1645,10 +1654,6 @@ struct PipelineCache::ProgramCache {
 		size_t queued   = 0;
 		size_t in_store = 0;
 		LockPrograms();
-		std::unordered_set<ProgramKey, ProgramKeyHash> store_keys;
-		for (const auto& [key, count]: in_flight) {
-			store_keys.insert(key);
-		}
 		for (const auto& source: replay_records.programs) {
 			if (source.user_data.size() > ShaderParams {}.user_data.size()) {
 				continue;
@@ -1689,6 +1694,7 @@ struct PipelineCache::ProgramCache {
 					break;
 				default: continue;
 			}
+			record_keys.insert(job->key);
 			if (store_keys.contains(job->key)) {
 				in_store++;
 				continue;
