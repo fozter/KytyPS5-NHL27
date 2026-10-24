@@ -277,7 +277,9 @@ private:
 	// line the execution thread reads.
 	template <typename T>
 	struct SnapshotRing {
-		static constexpr size_t Size = 512;
+		// Slots allocated; the ring wraps after NarrowSize of them unless WideSnapshotRing is on.
+		static constexpr size_t Size       = 2048;
+		static constexpr size_t NarrowSize = 512;
 		struct alignas(64) Slot {
 			T        value;
 			uint64_t id = 0;

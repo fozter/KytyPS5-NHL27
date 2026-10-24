@@ -972,8 +972,15 @@ const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& 
 		slot.value   = live;
 		slot.id      = s_snapshot_ids.fetch_add(1, std::memory_order_relaxed) + 1;
 		ring.current = ring.next;
-		ring.next    = (ring.next + 1) % SnapshotRing<T>::Size;
-		dirty        = false;
+		// Experiment WideSnapshotRing: the command processor may run 2048 snapshots ahead of the
+		// execution thread instead of 512 (run 197: it waited here ~40% of its time while the
+		// execution thread idled ~37%). Every overwrite waits for the slot's last use above, so
+		// switching the wrap point while running is safe.
+		const size_t wrap = Common::Experiments::Enabled(Common::Experiments::WideSnapshotRing)
+		                        ? SnapshotRing<T>::Size
+		                        : SnapshotRing<T>::NarrowSize;
+		ring.next = ring.next + 1 >= wrap ? 0 : ring.next + 1;
+		dirty     = false;
 	}
 	// The operation built from this state is the next one the command processor emits.
 	ring.last_use[ring.current] = sequence;

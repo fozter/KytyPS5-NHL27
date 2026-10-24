@@ -59,6 +59,7 @@ enum Bit : uint64_t {
 	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default off; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
 	CpCleanRegReads      = uint64_t {1} << 35u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
 	CpSkipIdleSpin       = uint64_t {1} << 36u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
+	WideSnapshotRing     = uint64_t {1} << 38u, // KYTY_WIDE_SNAPSHOT_RING (default off; the command processor keeps up to 2048 register snapshots ahead of the execution thread instead of 512)
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,

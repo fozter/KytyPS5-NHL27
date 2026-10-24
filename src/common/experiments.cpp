@@ -76,6 +76,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_SPECULATE_DIRTY_READS", SpeculateDirtyReads, false);
 	set("KYTY_CP_CLEAN_REG_READS", CpCleanRegReads, false);
 	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
+	set("KYTY_WIDE_SNAPSHOT_RING", WideSnapshotRing, false);
 	return mask;
 }
 
@@ -85,6 +86,37 @@ struct State {
 	State() {
 		const uint64_t defaults = EnvironmentMask();
 		mask.store(defaults, std::memory_order_relaxed);
+		// A/B inside one run: KYTY_EXPERIMENT_ALTERNATE_BITS=<mask> (decimal, or 0x hex) and
+		// KYTY_EXPERIMENT_ALTERNATE=S turn those bits on in even S-second windows of the steady clock
+		// and off in odd ones, as tools/frame_trace.py --alternate S splits a trace.
+		const char* bits_env   = std::getenv("KYTY_EXPERIMENT_ALTERNATE_BITS");
+		const char* period_env = std::getenv("KYTY_EXPERIMENT_ALTERNATE");
+		if (bits_env != nullptr && period_env != nullptr) {
+			const uint64_t bits      = std::strtoull(bits_env, nullptr, 0);
+			const uint64_t period_us = std::strtoull(period_env, nullptr, 10) * 1000000u;
+			if (bits != 0 && period_us != 0) {
+				std::thread([this, defaults, bits, period_us] {
+					uint64_t last = defaults;
+					for (;;) {
+						const auto now = static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::microseconds>(
+						        std::chrono::steady_clock::now().time_since_epoch())
+						        .count());
+						const uint64_t value =
+						    (now / period_us) % 2 == 0 ? (defaults | bits) : (defaults & ~bits);
+						if (value != last) {
+							mask.store(value, std::memory_order_relaxed);
+							std::printf("Experiments: alternate mask %" PRIu64 " -> %" PRIu64 "\n", last,
+							            value);
+							std::fflush(stdout);
+							last = value;
+						}
+						std::this_thread::sleep_for(std::chrono::milliseconds(20));
+					}
+				}).detach();
+				return;
+			}
+		}
 		const char* path_env = std::getenv("KYTY_EXPERIMENT_FILE");
 		if (path_env == nullptr || path_env[0] == '\0') {
 			return;
