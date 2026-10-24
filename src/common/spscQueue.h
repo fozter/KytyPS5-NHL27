@@ -31,15 +31,32 @@ inline void SpinPause() noexcept {
 // How long a pipeline thread spins on an empty or full handoff before it falls back to a kernel
 // wait: KYTY_GPU_SPIN_US microseconds, 2 ms by default. Within a busy frame the stages never
 // wait that long, so they never enter the kernel; an idle stage stops burning its core.
+// KYTY_SPIN_ALTERNATE=S (A/B inside one run): in even S-second windows of the steady clock the
+// budget is KYTY_GPU_SPIN_SHORT_US (100 by default) instead, as tools/frame_trace.py --alternate S
+// splits a trace (even windows = ON).
 inline std::chrono::nanoseconds SpinBudget() noexcept {
-	static const auto budget = [] {
-		uint64_t micros = 2000;
-		if (const char* value = std::getenv("KYTY_GPU_SPIN_US"); value != nullptr) {
-			micros = std::strtoull(value, nullptr, 10);
-		}
-		return std::chrono::nanoseconds(micros * 1000u);
+	struct Settings {
+		std::chrono::nanoseconds budget;
+		std::chrono::nanoseconds short_budget;
+		uint64_t                 alternate_us = 0;
+	};
+	static const auto settings = [] {
+		const auto micros = [](const char* name, uint64_t fallback) {
+			const char* value = std::getenv(name);
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : fallback;
+		};
+		return Settings {std::chrono::nanoseconds(micros("KYTY_GPU_SPIN_US", 2000) * 1000u),
+		                 std::chrono::nanoseconds(micros("KYTY_GPU_SPIN_SHORT_US", 100) * 1000u),
+		                 micros("KYTY_SPIN_ALTERNATE", 0) * 1000000u};
 	}();
-	return budget;
+	if (settings.alternate_us == 0) {
+		return settings.budget;
+	}
+	const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	return (static_cast<uint64_t>(now) / settings.alternate_us) % 2 == 0 ? settings.short_budget
+	                                                                     : settings.budget;
 }
 
 // Busy-waiting with an exponential _mm_pause backoff (1, 2, 4 ... 64 pauses per round) that
