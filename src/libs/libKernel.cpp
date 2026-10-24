@@ -11,6 +11,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
+#include "kernel/module.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
@@ -65,7 +66,6 @@ LIB_DEFINE(InitLibKernel_1_Apr);
 
 namespace LibKernel {
 
-using KernelModule                   = int32_t;
 using get_thread_atexit_count_func_t = KYTY_SYSV_ABI int (*)(KernelModule);
 using thread_atexit_report_func_t    = KYTY_SYSV_ABI void (*)(KernelModule);
 
@@ -1201,9 +1201,9 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	return OK;
 }
 
-static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_name, size_t args,
-                                                        const void* argp, uint32_t flags,
-                                                        const KernelLoadModuleOpt* opt, int* res) {
+KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, size_t args,
+                                                 const void* argp, uint32_t flags,
+                                                 const KernelLoadModuleOpt* opt, int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -1255,9 +1255,9 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 	return static_cast<KernelModule>(handle);
 }
 
-static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
-                                                uint32_t flags, const KernelUnloadModuleOpt* opt,
-                                                int* res) {
+int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
+                                        uint32_t flags, const KernelUnloadModuleOpt* opt,
+                                        int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -3111,16 +3111,15 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("UK2Tl2DWUns", FileSystem::KernelClose);
 	LIB_FUNC("Cg4srZ6TKbU", FileSystem::KernelRead);
 	LIB_FUNC("4wSze92BhLI", FileSystem::KernelWrite);
+	LIB_FUNC("kAt6VDbHmro", FileSystem::KernelWritev);
 	LIB_FUNC("+r3rMFwItV4", FileSystem::KernelPread);
 	LIB_FUNC("yTj62I7kw4s", FileSystem::KernelPreadv);
 	LIB_FUNC("nKWi-N2HBV4", FileSystem::KernelPwrite);
 	LIB_FUNC("mBd4AfLP+u8", FileSystem::KernelPwritev);
-	LIB_FUNC("kAt6VDbHmro", FileSystem::KernelWritev);
 	LIB_FUNC("WlyEA-sLDf0", FileSystem::KernelTruncate);
 	LIB_FUNC("VW3TVZiM4-E", FileSystem::KernelFtruncate);
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
-	LIB_FUNC("VW3TVZiM4-E", FileSystem::KernelFtruncate);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);
 	LIB_FUNC("52NcYU9+lEo", FileSystem::KernelRename);
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);

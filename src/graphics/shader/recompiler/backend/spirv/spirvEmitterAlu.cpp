@@ -285,10 +285,26 @@ uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1)
 		              Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pack_lane(arg1),
 		                     ConstantU32(state, 16)));
 	}
-	const auto low  = EmitF32ToF16RtzBits(state, arg0);
-	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-	                         EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16));
-	return Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
+	// Upstream 83db2efe: pack with the native conversion, then step each half whose magnitude
+	// grew one unit toward zero. Same bits as the integer emulation for finite values and
+	// infinity, in about a fifth of the instructions.
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0, arg1);
+	const auto packed = EmitPackHalf2x16(state, pair);
+	const auto back   = EmitExt(state, TypeF32Vector(state, 2), GLSLstd450UnpackHalf2x16, {packed});
+	auto       result = packed;
+	for (uint32_t i = 0; i < 2; i++) {
+		const auto rounded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), rounded, back, i);
+		const auto above =
+		    Binary(state, spv::OpFOrdGreaterThan, TypeBool(state),
+		           EmitExt(state, TypeF32(state), GLSLstd450FAbs, {rounded}),
+		           EmitExt(state, TypeF32(state), GLSLstd450FAbs, {i == 0 ? arg0 : arg1}));
+		result = Binary(state, spv::OpISub, TypeU32(state), result,
+		                Select(state, TypeU32(state), above,
+		                       ConstantU32(state, i == 0 ? 1u : 0x10000u), ConstantU32(state, 0)));
+	}
+	return result;
 }
 
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {

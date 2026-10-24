@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <array>
+#include <bitset>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -123,8 +124,9 @@ private:
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		Type type;
+		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
+		std::bitset<8192> clear_mask;
 	};
 
 	struct OverlapResult {

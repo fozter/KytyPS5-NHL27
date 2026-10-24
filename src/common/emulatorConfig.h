@@ -92,6 +92,7 @@ struct ConfigOptions {
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
+	uint32_t               trophy_duration_seconds     = 6;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
@@ -150,6 +151,7 @@ bool ReadbackLinearImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
+uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 // GpuPipelineStage bits. The KYTY_GPU_PIPELINE environment variable overrides the option: 0 runs

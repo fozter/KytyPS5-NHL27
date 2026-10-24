@@ -1317,14 +1317,14 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
 	BufferCache::PerfCount(BufferCache::PerfEvent::AcquireMem);
 	if (BufferCache::GuestSyncOnly()) {
 		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point
 		// where earlier shader writes must become visible.
 		cp.EmitGlobalBarrier();
 	}
-	return (cmd_id == 0xc0061050 ? 7 : 6);
+	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {

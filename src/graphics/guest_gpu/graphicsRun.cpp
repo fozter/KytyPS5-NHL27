@@ -2086,7 +2086,6 @@ static bool BdaBoundaryKind(uint32_t opcode, uint32_t header, RenderContext::Bda
 		case Pm4::IT_NOP:
 			switch (KYTY_PM4_R(header)) {
 				case Pm4::R_WAIT_FLIP_DONE: kind = B::Wait; return true;
-				case Pm4::R_ACQUIRE_MEM: kind = B::Acquire; return true;
 				case Pm4::R_RELEASE_MEM: kind = B::Event; return true;
 				case Pm4::R_FLIP: kind = B::Flip; return true;
 				default: return false;
