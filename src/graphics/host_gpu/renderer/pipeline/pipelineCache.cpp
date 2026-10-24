@@ -1376,8 +1376,9 @@ struct PipelineCache::ProgramCache {
 		}
 		in_flight[lookup_key]++;
 		{
+			// Ahead of the store and warm-up backlog: upcoming draws need these programs next.
 			std::lock_guard lock(job_mutex);
-			jobs.push_back(std::move(job));
+			jobs.push_front(std::move(job));
 		}
 		job_available.notify_one();
 	}
