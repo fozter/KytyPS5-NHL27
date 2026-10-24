@@ -541,7 +541,6 @@ struct Ngs2VoiceInternal {
 	struct Block {
 		const uint8_t*    data;
 		Ngs2WaveformBlock info;
-		uint32_t          cursor         = 0;
 		size_t            data_cursor    = 0;
 		uint32_t          repeated_count = 0;
 	};
@@ -595,10 +594,15 @@ struct Ngs2VoiceInternal {
 			return waveform_end;
 		}
 		const auto& block = blocks.front();
-		return block.data + (decoder != nullptr
-		                         ? block.data_cursor
-		                         : (uint64_t(block.info.num_skip_samples) + block.cursor) *
-		                               channels * sizeof(int16_t));
+		if (decoder != nullptr) {
+			return block.data + block.data_cursor;
+		}
+		// PCM never reads skipped samples, so the next read starts past a pending skip.
+		const auto skip = block.info.num_samples != 0 && block.data_cursor == 0
+		                      ? block.info.num_skip_samples
+		                      : skip_remaining;
+		return block.data + std::min(block.data_cursor + size_t(skip) * channels * sizeof(int16_t),
+		                             block.info.data_size);
 	}
 
 	// Custom racks keep num_buffers consecutive channel-major buffers; other racks keep one.
@@ -687,7 +691,6 @@ struct Ngs2VoiceInternal {
 		const bool clear     = (flags & 4u) != 0;
 		const bool only_data = (flags & 2u) != 0;
 		const bool join      = only_data && (flags & 0x10u) == 0;
-		EXIT_NOT_IMPLEMENTED(only_data && decoder == nullptr);
 		const auto retained = clear ? 0 : blocks.size();
 		Block      tail     = retained == 0 ? Block {} : blocks.back();
 		std::vector<Block> pending;
@@ -703,10 +706,6 @@ struct Ngs2VoiceInternal {
 				info.num_skip_samples = 0;
 				info.num_samples      = 0;
 			}
-			EXIT_NOT_IMPLEMENTED(decoder == nullptr &&
-			                     (uint64_t(info.num_skip_samples) + info.num_samples) *
-			                             channels * sizeof(int16_t) >
-			                         info.data_size);
 			Block block {data + info.data_offset, info};
 			auto* previous = pending.empty() ? (retained == 0 ? nullptr : &tail)
 			                                 : &pending.back();
@@ -1546,9 +1545,8 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 			--block.info.num_repeats;
 		}
 		++block.repeated_count;
-		block.cursor = 0;
+		block.data_cursor = 0;
 		if (voice.decoder != nullptr) {
-			block.data_cursor = 0;
 			voice.compressed_input.clear();
 			voice.decoder->Reset();
 		}
@@ -1573,37 +1571,8 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	return voice.source_generation == generation;
 }
 
-static bool Ngs2DecodePcmFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
-                               uint32_t& frame_samples) {
-	// PCM has no encoded frame size. Use one system grain as a bounded staging
-	// quantum, keeping source decoding separate from resampled output consumption.
-	const auto quantum = std::max(voice.rack->ngs->option.num_grain_samples, 1u);
-	frame.resize(size_t(quantum) * voice.channels);
-	frame_samples = 0;
-	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty() &&
-	       frame_samples < quantum) {
-		auto& block = voice.blocks.front();
-		const auto count = std::min(quantum - frame_samples, block.info.num_samples - block.cursor);
-		const auto* pcm = reinterpret_cast<const int16_t*>(voice.WaveformData());
-		for (size_t i = 0; i < size_t(count) * voice.channels; ++i) {
-			frame[size_t(frame_samples) * voice.channels + i] = pcm[i] / 32768.0f;
-		}
-		block.cursor += count;
-		frame_samples += count;
-		voice.decoded_samples += count;
-		voice.decoded_bytes += size_t(count) * voice.channels * sizeof(int16_t);
-		if (block.cursor == block.info.num_samples && !Ngs2FinishBlock(voice)) {
-			return false;
-		}
-	}
-	return frame_samples != 0;
-}
-
 static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
                             uint32_t& frame_samples) {
-	if (voice.decoder == nullptr) {
-		return Ngs2DecodePcmFrame(voice, frame, frame_samples);
-	}
 	frame_samples = 0;
 	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty()) {
 		auto& block = voice.blocks.front();
@@ -1614,6 +1583,41 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 		if (voice.duration_remaining == 0) {
 			if (!Ngs2FinishBlock(voice)) {
 				return false;
+			}
+			continue;
+		}
+		if (voice.decoder == nullptr) {
+			// PCM has no encoded frame size, so stage at most one system grain.
+			const auto quantum     = std::max(voice.rack->ngs->option.num_grain_samples, 1u);
+			const auto frame_bytes = voice.channels * sizeof(int16_t);
+			const auto available   = (block.info.data_size - block.data_cursor) / frame_bytes;
+			const auto skip        = std::min<size_t>(voice.skip_remaining, available);
+			const auto count =
+			    std::min<size_t>({available - skip, voice.duration_remaining, quantum});
+			frame.resize(size_t(quantum) * voice.channels);
+			const auto* pcm = reinterpret_cast<const int16_t*>(block.data + block.data_cursor) +
+			                  skip * voice.channels;
+			for (size_t i = 0; i < count * voice.channels; ++i) {
+				frame[i] = pcm[i] / 32768.0f;
+			}
+			voice.skip_remaining -= skip;
+			voice.duration_remaining -= count;
+			block.data_cursor += (skip + count) * frame_bytes;
+			voice.decoded_bytes += (skip + count) * frame_bytes;
+			voice.decoded_samples += count;
+			frame_samples = static_cast<uint32_t>(count);
+			if (voice.duration_remaining == 0 ||
+			    block.info.data_size - block.data_cursor < frame_bytes) {
+				// A repeating block restarts its duration, so it must hold all of it.
+				EXIT_NOT_IMPLEMENTED(voice.duration_remaining != 0 &&
+				                     (block.data_cursor != block.info.data_size ||
+				                      block.info.num_repeats != 0));
+				if (!Ngs2FinishBlock(voice)) {
+					return false;
+				}
+			}
+			if (count != 0) {
+				return true;
 			}
 			continue;
 		}
@@ -1922,7 +1926,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 	const auto grain = ngs->option.num_grain_samples;
 	for (auto* voice: voices) {
 		Ngs2RenderVoice(*voice, voices, grain);
-		if (voice->rack->type != Ngs2RackType::Mastering || !voice->has_samples) {
+		const bool mastering = voice->rack->type == Ngs2RackType::Mastering ||
+		                       voice->rack->type == Ngs2RackType::CustomMastering;
+		if (!mastering || !voice->has_samples) {
 			continue;
 		}
 		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
@@ -2552,9 +2558,25 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				voice->channels = channels[0];
 				break;
 			}
-			case 0x4003:
-				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomMastering);
+			case 0x4003: {
+				// SceNgs2CustomMasteringVoiceSetupParam {numInputChannels, flags} or
+				// SceNgs2CustomMasteringVoiceOutputParam {outputId, reserved}.
+				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomMastering ||
+				                     param->size != sizeof(Ngs2VoiceParamHeader) + 8u);
+				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
+				switch (param->id & 0xffffu) {
+					case 0:
+						EXIT_NOT_IMPLEMENTED(values[0] == 0 ||
+						                     values[0] > voice->rack->option.common.max_voice_channels ||
+						                     values[1] != 0);
+						voice->channels = values[0];
+						break;
+					case 1: voice->output_id = values[0]; break;
+					default:
+						EXIT("unsupported custom mastering control: 0x%08" PRIx32 "\n", param->id);
+				}
 				break;
+			}
 			default: EXIT("unknown rack_id: 0x%" PRIx32 "\n", rack_id);
 		}
 

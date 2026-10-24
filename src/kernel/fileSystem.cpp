@@ -411,6 +411,11 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 	return g_mount_points->ResolvePath(mounted_file_name);
 }
 
+bool IsOpenDescriptor(int d) {
+	const auto* file = g_files->GetFile(d);
+	return file != nullptr && file->opened;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static int KernelOpenImpl(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
