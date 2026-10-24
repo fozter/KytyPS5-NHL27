@@ -1320,6 +1320,8 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t>                                       code;
 		std::vector<uint32_t>                                       back_code;
 		bool                                                        stored = false;
+		// A warm-up record (replay_records): its recorded guest reads derive the specialization.
+		const PipelineRecord::Program*                              replay = nullptr;
 	};
 	static constexpr uint32_t CompileWorkers = 6;
 
@@ -1421,13 +1423,16 @@ struct PipelineCache::ProgramCache {
 				GuestReadLog                           reads;
 				ShaderRecompiler::IR::ResourceSnapshot resources;
 				specialization.emplace();
+				// Warm-up records run before the game is loaded: they read their recorded words.
+				auto* replay = const_cast<PipelineRecord::Program*>(job.replay);
 				const ShaderRecompiler::IR::SrtRuntime runtime {
 				    .user_data =
 				        std::span(job.params.user_data).first(job.params.user_data_count),
 				    .shader_base                = job.params.Base(),
-				    .read_memory                = ReadAheadPlain,
-				    .userdata                   = &reads,
-				    .read_specialization_memory = ReadAheadStrict,
+				    .read_memory                = replay != nullptr ? ReplayRawWords : ReadAheadPlain,
+				    .userdata = replay != nullptr ? static_cast<void*>(replay) : &reads,
+				    .read_specialization_memory =
+				        replay != nullptr ? ReplayCleanWords : ReadAheadStrict,
 				};
 				if (!ShaderRecompiler::IR::MaterializeResources(*plan, runtime, resources,
 				                                                *specialization)) {
@@ -1611,6 +1616,91 @@ struct PipelineCache::ProgramCache {
 		                 Common::PathToString(path));
 	}
 
+	// Warm-up records of earlier sessions, replayed on the workers (QueueRecords).
+	PipelineRecord::Records replay_records;
+
+	// Background warm-up: the recorded programs compile on the workers with their recorded guest
+	// reads, so the window opens without waiting ~2.5 min for them; a draw that needs one first
+	// waits for its job (WaitForCompile). Keys the store queued are skipped. Pipelines are created
+	// on first use, which the driver cache keeps short. KYTY_SHADER_WARMUP_SYNC=1: the old
+	// blocking warm-up (WarmUp).
+	void QueueRecords() {
+		if (replay_records.programs.empty()) {
+			return;
+		}
+		size_t queued   = 0;
+		size_t in_store = 0;
+		LockPrograms();
+		std::unordered_set<ProgramKey, ProgramKeyHash> store_keys;
+		for (const auto& [key, count]: in_flight) {
+			store_keys.insert(key);
+		}
+		for (const auto& source: replay_records.programs) {
+			if (source.user_data.size() > ShaderParams {}.user_data.size()) {
+				continue;
+			}
+			auto job   = std::make_unique<CompileJob>();
+			job->stage = source.stage;
+			job->key   = {.stage           = source.stage,
+			              .hash            = source.hash,
+			              .user_data_count = static_cast<uint32_t>(source.user_data.size()),
+			              .code_size       = static_cast<uint32_t>(source.code.size())};
+			switch (source.stage) {
+				case ShaderType::Vertex:
+					if (source.vertex.native_draw.Enabled() &&
+					    !graphics.native_draw_parameters_enabled) {
+						continue;
+					}
+					job->vertex        = std::make_unique<ShaderVertexInputInfo>(source.vertex);
+					job->vertex->stage = {};
+					BuildStageStaticKey(*job->vertex, job->key.static_state);
+					break;
+				case ShaderType::Pixel: {
+					job->pixel        = std::make_unique<ShaderPixelInputInfo>(source.pixel);
+					job->pixel->stage = {};
+					const char* quad  = std::getenv("KYTY_PIXEL_QUAD_CORRECT");
+					job->pixel->pixel_quad_correct =
+					    graphics.pixel_quad_supported && quad != nullptr && quad[0] == '1';
+					BuildStageStaticKey(*job->pixel, job->key.static_state);
+					break;
+				}
+				case ShaderType::Compute:
+					job->compute        = std::make_unique<ShaderComputeInputInfo>(source.compute);
+					job->compute->stage = {};
+					job->compute->host_subgroup_size = graphics.SupportsComputeWave64() ? 64u : 32u;
+					job->compute->lds_storage =
+					    job->compute->lds_size_dwords * 4u >
+					    graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+					BuildStageStaticKey(*job->compute, job->key.static_state);
+					break;
+				default: continue;
+			}
+			if (store_keys.contains(job->key)) {
+				in_store++;
+				continue;
+			}
+			job->params.code            = source.code;
+			job->params.back_code       = source.back_code;
+			job->params.base            = source.shader_base;
+			job->params.hash            = source.hash;
+			job->params.user_data_count = static_cast<uint32_t>(source.user_data.size());
+			std::ranges::copy(source.user_data, job->params.user_data.begin());
+			job->push_data_cursor = source.push_data_cursor;
+			job->replay           = &source;
+			in_flight[job->key]++;
+			{
+				std::lock_guard lock(job_mutex);
+				jobs.push_back(std::move(job));
+			}
+			queued++;
+		}
+		UnlockPrograms();
+		job_available.notify_all();
+		PipelineCacheLog("Shader warm-up: {} recorded programs queued for background compilation "
+		                 "({} already queued from the store)",
+		                 queued, in_store);
+	}
+
 	void StartWorkers(std::atomic_flag* lock) {
 		program_lock = lock;
 		for (uint32_t i = 0; i < CompileWorkers; i++) {
@@ -1669,6 +1759,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		}
 		m_program_cache->LoadStore(directory / name);
 	}
+	m_program_cache->QueueRecords();
 	m_program_cache->StartWorkers(&m_program_lock);
 }
 
@@ -1867,6 +1958,16 @@ void PipelineCache::InitializeShaderRecord() {
 		                 Common::PathToString(path));
 	}
 	m_program_cache->record = m_record.get();
+	// KYTY_SHADER_WARMUP_SYNC=1: compile the records here, before the window opens. Otherwise the
+	// constructor queues them to the workers after the store (ProgramCache::QueueRecords).
+	static const bool sync = [] {
+		const char* value = std::getenv("KYTY_SHADER_WARMUP_SYNC");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!sync) {
+		m_program_cache->replay_records = std::move(records);
+		return;
+	}
 	WarmUp(records);
 }
 
