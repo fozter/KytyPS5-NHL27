@@ -1523,8 +1523,13 @@ struct PipelineCache::ProgramCache {
 	void Store(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
 	           uint32_t                                            push_data_cursor,
 	           const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
-		// A program loaded from the store is not stored again (store_keys).
-		if (store == nullptr || replaying != nullptr || store_keys.contains(key)) {
+		if (store == nullptr || replaying != nullptr) {
+			return;
+		}
+		// A permutation loaded from the store is not stored again (store_specializations).
+		if (const auto stored = store_specializations.find(key);
+		    stored != store_specializations.end() &&
+		    std::ranges::find(stored->second, specialization) != stored->second.end()) {
 			return;
 		}
 		StoredProgram program;
@@ -1619,7 +1624,7 @@ struct PipelineCache::ProgramCache {
 			job->push_data_cursor       = program.push_data_cursor;
 			job->specialization         = std::move(program.specialization);
 			job->stored                 = true;
-			store_keys.insert(job->key);
+			store_specializations[job->key].push_back(*job->specialization);
 			LockPrograms();
 			in_flight[job->key]++;
 			UnlockPrograms();
@@ -1636,10 +1641,13 @@ struct PipelineCache::ProgramCache {
 
 	// Warm-up records of earlier sessions, replayed on the workers (QueueRecords).
 	PipelineRecord::Records replay_records;
-	// Keys loaded from the store and the record at startup (read-only afterwards): a program
-	// compiled again because its job was taken back (WaitForCompile) is not stored or recorded a
-	// second time, so neither file grows with duplicates every boot.
-	std::unordered_set<ProgramKey, ProgramKeyHash> store_keys;
+	// What the store and the record held at startup (read-only afterwards): a program compiled
+	// again because its job was taken back (WaitForCompile) is not stored or recorded a second
+	// time, so neither file grows with duplicates every boot. The store compares permutations (a
+	// new specialization of a stored program is still stored); the record compares keys.
+	std::unordered_map<ProgramKey, std::vector<ShaderRecompiler::IR::ResourceSpecialization>,
+	                   ProgramKeyHash>
+	                                               store_specializations;
 	std::unordered_set<ProgramKey, ProgramKeyHash> record_keys;
 
 	// Background warm-up: the recorded programs compile on the workers with their recorded guest
@@ -1695,7 +1703,7 @@ struct PipelineCache::ProgramCache {
 				default: continue;
 			}
 			record_keys.insert(job->key);
-			if (store_keys.contains(job->key)) {
+			if (store_specializations.contains(job->key)) {
 				in_store++;
 				continue;
 			}
