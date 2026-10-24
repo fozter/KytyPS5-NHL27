@@ -57,11 +57,14 @@ public:
 		for (const auto& use: users) affected.push_back({use.user, 1u});
 		// Pattern folds inspect nested operands even when intermediate operations
 		// stay dynamic. Visit consumers once per change, including cyclic Phi edges.
-		// KYTY_CONSTPROP_USER_DEPTH=N stops at the N-th level of users (default: all of them, which
-		// costs a walk over every transitive user per change, ~95% of shader compile time).
+		// Up to 8 levels of users: walking every transitive user per change cost ~95% of shader
+		// compile time (NHL 27 warm-up of ~3300 records: 236.9 s unlimited, 18.2 s at 8, 16.0 s at
+		// 3). Of 1390 compiled NHL 27 permutations, 1389 came out bit-identical; the other keeps
+		// a && (b || c) distributed as (a && b) || (a && c). KYTY_CONSTPROP_USER_DEPTH=N sets the
+		// limit, 0 = unlimited.
 		static const uint32_t max_depth = [] {
 			const char* value = std::getenv("KYTY_CONSTPROP_USER_DEPTH");
-			const auto  depth = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+			const auto  depth = value != nullptr ? std::strtoul(value, nullptr, 10) : 8ul;
 			return depth != 0 ? static_cast<uint32_t>(depth) : UINT32_MAX;
 		}();
 		for (size_t i = 0; i < affected.size(); ++i) {
