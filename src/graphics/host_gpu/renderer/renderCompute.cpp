@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/experiments.h"
 #include "common/file.h"
@@ -1214,6 +1215,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!Nhl27Fsr3::Enabled() || !m_nhl27_fsr3 ||
 	    !m_nhl27_fsr3->ReplacesDispatch(m_context, buffer, program.shader_hash, bindings)) {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	}
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	m_context.GetTextureCache().FlushStorageShadows();
@@ -1482,6 +1484,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	BreadcrumbCaptureArgs(vk_buffer, crumb, args_buffer->Handle(), args_offset,
 	                      sizeof(vk::DispatchIndirectCommand));
 	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	m_context.GetTextureCache().FlushStorageShadows();
 	record_timer.Stop();

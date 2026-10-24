@@ -4,6 +4,7 @@
 #include "common/experiments.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -396,14 +397,8 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (image->info.HasMetadata()) {
-		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
-		if (metadata != m_surface_metas.end() &&
-		    image->info.metadata.kind == ImageMetadataKind::Htile &&
-		    metadata->second.type == MetaDataInfo::Type::HTile) {
-			// A later binding may have reused this address for another metadata type.
-			m_surface_metas.erase(metadata);
-		}
+	if (image->info.metadata.kind == ImageMetadataKind::Htile) {
+		m_surface_metas.erase(image->info.metadata.range.address);
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -1330,6 +1325,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
 		const auto copies = info.BufferCopies(linear.offset);
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
 	}
 
@@ -1375,6 +1371,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		copies[0].imageExtent       = info.extent;
 	}
 	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
 void TextureCache::InitializeImage(ImageId id) {
@@ -1418,7 +1415,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
-		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
+		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
@@ -2147,11 +2144,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		if (inserted) {
-			metadata->second.type = MetaDataInfo::Type::HTile;
-			if (image.info.htile_initial_clear) {
-				metadata->second.clear_mask.set();
-			}
+		if (inserted && image.info.htile_initial_clear) {
+			metadata->second.clear_mask.set();
 		}
 	}
 	RefreshImage(id);
@@ -2518,6 +2512,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	download.Flush(offset, range.size);
 
 	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -2711,6 +2706,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			BufferCache::PerfCount(BufferCache::PerfEvent::ImageGcFree);
 			FreeImage(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

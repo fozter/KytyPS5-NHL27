@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -691,7 +692,7 @@ void RenderExecutor::StoreRenderTargetMemo(const RenderColorInfo* colors, uint32
 	auto& memo   = *m_render_target_memo;
 	memo.pending = false;
 	// Clears consume their state; the next draw acquires its targets itself.
-	if (depth.depth_clear_enable || depth.depth_load_clear_enable || depth.stencil_clear_enable) {
+	if (depth.load_clear_aspects) {
 		return;
 	}
 	auto& cache             = m_context.GetTextureCache();
@@ -1042,16 +1043,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    memo != nullptr ? memo->depth_view
 		                    : cache.FindDepthTarget(depth.image_id, depth.desc, &stencil_id);
 		depth_view = image_view;
+		// Upstream 57791645/5bf37f52: load clears per aspect; a pending HTile clear also clears
+		// compressed stencil. A depth clear no longer marks every slice's HTile cleared.
+		depth.load_clear_aspects = {};
+		if (depth.depth_clear_enable) depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+		if (depth.stencil_clear_enable) depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 		if (memo == nullptr) {
 			const auto& metadata = depth.desc.info.metadata;
-			if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
-			    !cache.ClearMeta(metadata.range.address)) {
-				EXIT("failed to acquire HTile metadata for a depth clear\n");
-			}
 			const bool meta_clear =
 			    metadata.kind == ImageMetadataKind::Htile &&
 			    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-			depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+			if (meta_clear) depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+			if (meta_clear && metadata.stencil_compressed)
+				depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 			if (meta_clear &&
 			    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 				EXIT("failed to consume HTile clear state\n");
@@ -1110,9 +1114,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
-		attachment.depth_clear    = depth.depth_load_clear_enable;
+		attachment.depth_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eStencil);
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -1683,7 +1689,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     state.ps_input_info.ps_sample_mask_export_enable);
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
-	if (depth.depth_load_clear_enable) {
+	if (depth.load_clear_aspects) {
 		m_context.GetCommandScheduler().BeginRendering(rendering);
 	}
 	auto& cache = m_context.GetTextureCache();
@@ -2120,6 +2126,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		FrameDump::OnDraw(m_context, log);
 	}
 	m_context.GetTextureCache().FlushStorageShadows();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

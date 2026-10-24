@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/experiments.h"
 #include "common/logging/log.h"
@@ -1403,12 +1404,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::WriteData);
 		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
-		if (write_one_address) {
-			for (uint32_t i = 0; i < dw_num; i++) {
-				dst[0] = src[i];
-			}
-		} else {
-			memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+		// Upstream 099de8de: completion labels can be reused immediately; memcpy may write a
+		// destination twice.
+		auto* output = static_cast<volatile uint32_t*>(dst);
+		for (uint32_t i = 0; i < dw_num; i++) {
+			*output = src[i];
+			output += !write_one_address;
 		}
 	});
 	if (write_one_address) {
@@ -2951,6 +2952,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		return;
 	}
 	m_pending_instances.clear();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
 	const auto args_size =
 	    indirect.indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);

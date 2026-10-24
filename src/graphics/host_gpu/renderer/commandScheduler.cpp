@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/emulatorConfig.h"
 #include "common/profiler.h"
@@ -1540,6 +1541,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	m_submitted_tick.store(tick, std::memory_order_release);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceFault(graphics.device);
