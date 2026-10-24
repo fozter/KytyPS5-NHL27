@@ -37,6 +37,7 @@ public:
 	// Current thread: raises its priority to "highest", and restricts it to one logical
 	// processor (when `logical_cpu` is not negative). No-ops where unsupported.
 	static void RaiseCurrentPriority();
+	static void LowerCurrentPriority();
 	static void PinCurrent(int logical_cpu);
 
 	// Get current thread id

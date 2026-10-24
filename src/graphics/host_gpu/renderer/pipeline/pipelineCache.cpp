@@ -1383,7 +1383,19 @@ struct PipelineCache::ProgramCache {
 	// Execution thread, under the program lock: waits without the lock until no worker compiles
 	// the program of lookup_key. False when none did.
 	bool WaitForCompile() {
-		if (!in_flight.contains(lookup_key)) {
+		const auto count = in_flight.find(lookup_key);
+		if (count == in_flight.end()) {
+			return false;
+		}
+		// Jobs for this program that no worker started yet are taken back: the caller compiles it
+		// now instead of waiting behind the queue (a boot queues ~2000 warm-up records).
+		{
+			std::lock_guard lock(job_mutex);
+			const auto taken = std::erase_if(jobs, [&](const auto& job) { return job->key == lookup_key; });
+			count->second -= static_cast<uint32_t>(taken);
+		}
+		if (count->second == 0) {
+			in_flight.erase(count);
 			return false;
 		}
 		const auto key = lookup_key;
@@ -1480,6 +1492,8 @@ struct PipelineCache::ProgramCache {
 
 	void CompileWorker(const std::stop_token& stop) {
 		KYTY_PROFILER_THREAD("Thread_ShaderCompile");
+		// Background compiles (store, warm-up records) yield to the game's own threads.
+		Common::Thread::LowerCurrentPriority();
 		for (;;) {
 			std::unique_ptr<CompileJob> job;
 			{
